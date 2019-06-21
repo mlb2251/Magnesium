@@ -140,14 +140,14 @@ class SyncedFS:
                 return path
         return None
 
-    def load(self, fpath, expiration_check=True, no_error_on_dir=False):
+    def load(self, fpath, expiration_check=True, no_error_on_dir=False, **kwargs):
         # TODO make this load_nosplay and make another load() for splayed stuff
         """
         Does a locked load on a file using torch.load()
         """
         fpath = self.get_paths(fpath).absolute
         with self.fs.lock(fpath):
-            loaded = torch.load(fpath)
+            loaded = torch.load(fpath,**kwargs)
         return loaded
 
     @contextmanager
@@ -415,18 +415,34 @@ class SharedObject:
     A SharedObject lives on the disk in a file located at `self.path`. All attribute accesses are locked disk reads/writes, so no data actually stays in SharedObject.
     When you call SharedObject("/path/to/storage",fs) it will attach itself to whatever object lives at /path/to/storage, or will create a new object there if none exists.
     If there's one thing you should know about shared objects, it's that you should be using the load() contextmanager very frequently. If you have a weird bug where data is disappearing or state isn't being held you probably need to use load().
+
+    `mode` =
+        'any' -> dont throw any errors, just load it if it already exists and create it if it doesn't exist.
+        'new' -> call .new() using *args **kwargs. Also throw an error if it already exists()
+        'old' -> Throw an error if it doesn't already exists()
+        'clean' -> call .new() no matter what, even if it already exists (like 'any' but also wipes it clean)
     """
-    def __init__(self,path,fs):
+    def __init__(self,path,fs,mode,     *args,**kwargs):
         self.fs = fs
         self.path = fs.get_paths(path).absolute
         self.loaded = False # whether we're in the self.load() contextmanager
         with self.lock():
-            if not self.exists(): # initialize a new file on disk to back the data if it doesnt exist already
-                self.new()
+            if mode == 'any':
+                if not self.exists():
+                    self.new(*args,**kwargs)
+            elif mode == 'old':
+                assert self.exists()
+            elif mode == 'new':
+                assert not self.exists()
+                self.new(*args,**kwargs)
+            elif mode == 'clean':
+                self.new(*args,**kwargs)
+            else:
+                raise Exception(f"Mode {mode} not recognized in SharedObject __init__")
 
     @self.lock()
     def new(self):
-        self.fs.save({},self.path)
+        self.fs.save({},self.path) # save an empty dict at our path. This is our attribute dict.
 
     def exists(self):
         """
