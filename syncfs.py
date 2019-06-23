@@ -2,38 +2,65 @@ import os
 from os.path import join,isdir,isfile
 from os import mkdir,rmdir,makedirs
 from time import sleep
+import torch
 
 import time
 from collections import namedtuple
 from contextlib import contextmanager
+import util
+
+
+import pdb
+import traceback
+import sys
+@contextmanager
+def debug(do_debug):
+    try:
+        yield None
+    except Exception as e:
+        if do_debug:
+            print(''.join(traceback.format_exception(e.__class__,e,e.__traceback__)))
+            print(util.format_exception(e,''))
+            pdb.post_mortem()
+            sys.exit(1)
+        else:
+            raise e
+    finally:
+        pass
+
+
+
 
 # absolute path to file, absolute path to lockfile for the file, absolute path to guard file for the lockfile
 Paths = namedtuple('Paths','absolute lock guard')
 LockMsg = namedtuple('LockMsg','pid time name')
 
-LOCKDIR = '.fslock/'
-SHAREDDIR = '.sharedobjs/'
-GUARD_EXTENSION = '.lockguard'
-LOCKED_DIR_LIST = 'lockeddirlist'
 EXPIRATION_TIMEOUT = 10 # seconds till a lock expires
+GUARD_EXTENSION = '.lockguard'
 
 # TODO rewrite Locks as their own class to clean up SyncedFS
 
 """
-
 Notations:
 `fpath` refers to any filepath, relative or absolute it doesn't matter. If a fn takes an fpath you can give it anything and it'll figure it out.
-`abspath` is ofc an absolute path
+`abspath` is ofc an absolute path as in Paths.absolute
+`lockpath` refers to an absolute path to a lock as in Paths.lock
+`paths` refers to a Paths namedtuple
 Most other paths are absolute.
-
-
 
 """
 
 
 
 class SyncedFS:
+    """
+    A Synchronized filesystem.
+    """
     def __init__(self,root,name,verbose=False):
+        # we make these local here so you cant accidently use them outside
+        LOCKDIR = '.fslock/'
+        SHAREDDIR = '.sharedobjs/'
+        LOCKED_DIR_LIST = 'lockeddirlist'
         self.name = name # a name that all your locks will be tagged with
         assert ' ' not in self.name
         # root dir ends with '/'
@@ -46,8 +73,10 @@ class SyncedFS:
         self.lockdir = join(root,LOCKDIR)
         if not isdir(self.lockdir):
             mkdir(self.lockdir)
-        self.lockeddirlist = join(root,LOCKDIR,LOCKED_DIR_LIST)
-        self.shareddir = join(ROOT,SHAREDDIR)
+        self.lockeddirlist = join(self.lockdir,LOCKED_DIR_LIST)
+        if not isfile(self.lockeddirlist):
+            open(self.lockeddirlist,'w').close().close()
+        self.shareddir = join(self.root,SHAREDDIR)
         if not isdir(self.shareddir):
             mkdir(self.shareddir)
 
@@ -98,15 +127,17 @@ class SyncedFS:
     def no_locks(self):
         assert len(self.locks) == 0, f"{self.locks}"
 
+
     ## lockeddir stuff
-    def _add_lockeddir(self,abspath):
+    def add_lockeddir(self,fpath):
         """
         After calling _add_lockeddir(abspath) any future read/write to files that start with `abspath` will have to take this lock.
         """
-        assert _get_parent_lockeddir(abspath) is None, "Can't make a lockeddir inside a lockeddir"
-        _sanitize(abspath) # just do basic error checking on it
+        abspath = self.get_paths(fpath).absolute
+        assert isdir(abspath), "can't make a lockeddir on something that's not already a directory"
+        assert self._get_parent_lockeddir(abspath) is None, "Can't make a lockeddir inside a lockeddir"
         if self.verbose: print(f"adding lockeddir {abspath}")
-        with open(self.lockeddirlist,'+') as f:
+        with self.open(self.lockeddirlist,'+') as f:
             paths = f.read().split('\n')
             paths.append(abspath)
             f.write('\n'.join(paths))
@@ -118,9 +149,9 @@ class SyncedFS:
         paths = self.get_paths(fpath)
         assert not isfile(paths.abspath)
         if isdir(paths.abspath): # if it's already created assert that it is a locked directory
-            assert _get_parent_lockeddir(paths.abspath) == paths.abspath
+            assert self._get_parent_lockeddir(paths.abspath) == paths.abspath
         else: # not created
-            self.mkdir(abspath,locked=True)
+            self.mkdir(paths.abspath,locked=True)
 
     def _remove_lockeddir(self,abspath):
         if self.verbose: print(f"removing lockeddir {abspath}")
@@ -135,6 +166,8 @@ class SyncedFS:
         """
         with open(self.lockeddirlist,'r') as f:
             paths = f.read().split('\n')
+            if len(paths) == 1 and paths[0] == '':
+                return None
         for path in paths:
             if abspath.startswith(path):
                 return path
@@ -199,15 +232,15 @@ class SyncedFS:
         Does a torch.save on the provided object, using a temp file for safety in case we're interrupted. Doesn't do any splaying. Use `no_lock` to not take a lock (perhaps needed for some internal files that dont have locks). `path_check` is there for the same reason, eg if you wanna forcibly save something with a reserved extension.
         """
         if path_check:
-            fpath = self.get_paths(fpath).absolute
+            abspath = self.get_paths(fpath).absolute
 
         if no_lock:
-            torch.save(obj,f"{self.path}.tmp.{os.getpid()}") # safe since varnames cant have dots anyways
-            os.rename(f"{self.path}.tmp.{os.getpid()}",save_path)
+            torch.save(obj,f"{abspath}.tmp.{os.getpid()}") # safe since varnames cant have dots anyways
+            os.rename(f"{abspath}.tmp.{os.getpid()}",abspath)
             return
         with self.lock(abspath):
-            torch.save(obj,f"{self.path}.tmp.{os.getpid()}") # safe since varnames cant have dots anyways
-            os.rename(f"{self.path}.tmp.{os.getpid()}",save_path)
+            torch.save(obj,f"{abspath}.tmp.{os.getpid()}") # safe since varnames cant have dots anyways
+            os.rename(f"{abspath}.tmp.{os.getpid()}",abspath)
 
     def manual_lock(self, fpath, expiration_check=True, no_error_on_dir=False):
         """
@@ -215,7 +248,7 @@ class SyncedFS:
         Also checks if a lock is expired and automatically unlocks it if so.
         Returns nothing.
         Lock must be freed with .unlock() at the end of use.
-        See `lock` for a contextmanager version of this.
+        See `lock` for a contextmanager version of this with unlocks at the end for you, and should be used the vast majority of the time.
         """
         if self.verbose: print(f"manual_lock({fpath}) called")
         paths = self.get_paths(fpath)
@@ -244,7 +277,7 @@ class SyncedFS:
     # unlocks a file, throws an error if it was already unlocked (eg someone unlocked it bc of expiration)
     def unlock(self,fpath,no_error_on_dir=False):
         """
-        Unlocks a file, throwing an error if we were not the ones who locked it.
+        Unlock a lock that you own
         """
         if self.verbose: print(f"unlock({fpath}) called")
         paths = self.get_paths(fpath)
@@ -265,9 +298,9 @@ class SyncedFS:
 
         if paths.lock not in self.locks:
             raise LockError("You can't free a lock you didn't take!")
-        if not self._try_lock(paths.guard):
+        if self._try_lock(paths.guard) is False:
             raise LockError("There shouldn't be any competition for the guard on a lock we own, unless we're over the expiration limit which is not okay!")
-        # we now have the guard lock
+        # we now have the guard lock.
         # now lets make sure the lock is still ours
         if self.verbose: print(f"acquired guard lock")
         try:
@@ -289,12 +322,14 @@ class SyncedFS:
                 pid,lock_time,name = float(text[0]),float(text[1]),text[2]
                 lockmsg = LockMsg(pid,lock_time,name)
                 return lockmsg
+        except FileNotFoundError:
+            raise LockNotFoundError
         except OSError as e:
             raise LockError(f"read_lockmsg() failed due to an OSError: {e}")
 
     def _sanitize(self,fpath,mode='none'):
         """
-        Does validity checking on the provided path (no invalid names used), and turns it from whatever it is into a path relative to self.root, with no trailing '/'
+        Makes sure the provided path doesnt use any reserved names and is somewhere inside self.root, and turns it from whatever it is (aboslute or relative) into a path relative to self.root, with no trailing '/' even if it's a directory.
         """
         fpath = os.path.normpath(fpath) # remove '..' and '///' etc to canonicalize
         if fpath.startswith('/'):
@@ -305,7 +340,7 @@ class SyncedFS:
             fpath = fpath[1:]
         #if isdir(join(self.root,fpath)):
         #    raise ValueError(f"{fpath} is a directory, but must be a file (or uncreated) for all syncronization operations")
-        if fpath.startswith(LOCKDIR):
+        if fpath.startswith(self.lockdir):
             raise ValueError(f"{fpath} starts with the lock directory, which is an invalid place for non-lock files")
         if fpath.endswith(GUARD_EXTENSION):
             raise ValueError(f"{fpath} ends with the lock guard extension {GUARD_EXTENSION} which is invalid for non-guard files")
@@ -321,14 +356,15 @@ class SyncedFS:
     def _try_lock(self,lockpath):
         """
         Makes a single attempt to take a lock, returning True if taken and False if the lock is busy.
+        If successful, we add the lock to self.locks and increment its lock_count
         """
         lock_time = time.time()
         lockmsg = f"{os.getpid()} {lock_time} {self.name}"
         if self.verbose: print(f"attempting to lock {lockpath}")
 
-        if lockpath in self.locks: # we let ppl pretend theyre taking a lock multiple times
+        if lockpath in self.locks:
             self.lock_count[lockpath] += 1
-            return True
+            return True # we let ppl take a lock multiple times if they already own it, incrementing `self.lock_count[lockpath]` each time
 
         try:
             with open(lockpath,'x') as f: # open in 'x' mode (O_EXCL and O_CREAT) so it fails if file exists
@@ -336,31 +372,35 @@ class SyncedFS:
                 print(f"wrote lock message to {lockpath}")
             self.locks[lockpath] = lock_time
             self.lock_count[lockpath] = 1
-            return True
+            return True # we got the lock!
         except FileExistsError:
-            return False
+            return False # we did not get the lock
 
-    def _unlock(self,path):
+    def _unlock(self,lockpath,ours=True):
         """
-        Unchecked unlocking, just calls `rm` and throws a LockError if the file doesn't exist
-        This function doesn't require you to own the lock, though it does decrement your lock_count and pop the lock from self.locks.
+        When called with `ours`=True, we must own the lock, and it does decrements our lock_count[lockpath] and pop the lock from self.locks if the count hits 0.
+        When called with `ours`=False, this is unchecked unlocking, it just calls `rm` and throws a LockError if the file doesn't exist.
         """
-        if self.verbose: print(f"_unlock({path})")
+        if self.verbose: print(f"_unlock({lockpath})")
 
-        if path in self.locks:
-            self.lock_count[path] -= 1
-            if self.lock_count[path] != 0:
+        if ours is True:
+            assert lockpath in self.locks
+            self.lock_count[lockpath] -= 1
+            if self.lock_count[lockpath] > 0:
                 return # we only release a lock once lock_count hits 0
 
         # remove the lock
         try:
-            os.remove(path)
+            os.remove(lockpath)
         except OSError as e:
             raise LockError(f"_unlock() failed due to an OSError: {e}")
-        # cleanup the lock
-        self.locks.pop(path)
-        if time.time()-self.locks[path] >= EXPIRATION_TIMEOUT:
-            raise LockError("You held the lock for too long, that's not allowed!")
+
+        if ours is True:
+            # cleanup the lock
+            if time.time()-self.locks[lockpath] >= EXPIRATION_TIMEOUT:
+                self.locks.pop(lockpath)
+                raise LockError("You held the lock for too long, that's not allowed!")
+            self.locks.pop(lockpath)
 
 
     def _unlock_if_expired(self,paths):
@@ -371,7 +411,7 @@ class SyncedFS:
         """
         try:
             lockmsg = self._get_lockmsg(paths.lock)
-        except LockError:
+        except LockNotFoundError:
             return # someone already freed the lock for us
         if time.time()-lockmsg.time < EXPIRATION_TIMEOUT:
             return # it hasn't expired
@@ -384,12 +424,13 @@ class SyncedFS:
                 print("The creator of this lock (pid {lockmsg.pid}) is still alive (unless someone took its pid)")
             else:
                 print("The creator of this lock (pid {lockmsg.pid}) is not an active process")
-            self._unlock(paths.lock)
+            self._unlock(paths.lock,ours=False)
         finally:
             self._unlock(paths.guard)
         return
 
 class LockError(Exception): pass
+class LockNotFoundError(LockError): pass
 
 # must be a class since closures can't be pickled
 class SaveFn:
@@ -440,9 +481,9 @@ class SharedObject:
             else:
                 raise Exception(f"Mode {mode} not recognized in SharedObject __init__")
 
-    @self.lock()
     def new(self):
-        self.fs.save({},self.path) # save an empty dict at our path. This is our attribute dict.
+        with self.lock():
+            self.fs.save({},self.path) # save an empty dict at our path. This is our attribute dict.
 
     def exists(self):
         """
@@ -478,7 +519,7 @@ class SharedObject:
         if attr in ['fs','path','sticky','attr_dict']:
             super().__getattr__(attr)
         if self.loaded: # use local copy if `loaded`
-            return attr_dict[attr]
+            return self.attr_dict[attr]
         with self.load():
             return self.attr_dict[attr]
 
@@ -487,13 +528,14 @@ class SharedObject:
             super().__setattr__(attr,val)
             return
         if self.loaded: # use local copy if `loaded`
-            return attr_dict[attr] = val
+            self.attr_dict[attr] = val
+            return
         with self.load():
             self.attr_dict[attr] = val
 
-    @self.load()
     def __delattr__(self,attr):
-        self.attr_dict.pop(attr)
+        with self.load():
+            self.attr_dict.pop(attr)
 
 
 #    @contextmanager
@@ -538,7 +580,7 @@ class Splay:
         self.fs = fs
         self.splay_tree = self.build_splay_tree(obj)
     def save(self):
-        with self.fs.lock(self.path)
+        with self.fs.lock(self.path):
             self.do_save(self.splay_tree,self.path)
     def build_splay_tree(self,obj):
         """
@@ -573,16 +615,34 @@ class Splay:
         else:
             raise Exception("Unrecognized type sent to `do_save`")
 
+class Leaf:
+    def __init__(self,val):
+        self.val=val
 
-if __name__ == '__main__':
+
+
+
+def main():
     fs = SyncedFS('mg','test',verbose=True)
+
+    # message writing test
     with fs.open('test','w') as f:
         print("START")
-        f.write('ayyyy\nlmao')
-        sleep(17)
-        f.write('ya\nlmao')
+        f.write('message1\n')
+        f.write('message2')
         print("END")
+
+    # make sure that message was written successfully
+    with fs.open('test','r') as f:
+        assert f.read() == 'message1\nmessage2'
+
+
+    # make sure we aren't still holding any locks
     fs.no_locks()
 
 
+
+if __name__ == '__main__':
+    with debug(True):
+        main()
 

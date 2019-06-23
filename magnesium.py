@@ -244,30 +244,48 @@ class Project(SharedObject):
         super().__init__(path,fs,mode,    name)
     @self.lock()
     def new(self,name):
+        """
+        The new() function gets called (by SharedObject.__init__ usually) when the shared object gets completely wiped and reset, and also the very first time it is created.
+        """
         super().new()
-        self.name = name
-        self.exps = {}
+        self.name = name # unique Experiment name
+        self.exps = {} # expname->Experiment dict with all experiments
     @self.load
     def new_exp(self,name,suggestor,hypers_config):
+        """
+        Called by View.new_exp(). Creates a new Experiment and adds it to `self.exps`
+        """
         if name in self.exps:
             raise ValueError(f"new_exp(): There is already an experiment named {name}")
         self.exps[name] = Experiment(self.fs,'new',name,suggestor,hypers_config)
         return self.exps[name]
     @self.load
     def del_exp(self,name):
+        """
+        Called by View.del_exp(). Deletes an experiment by just poppin git from `self.exps`
+        """
         if name not in self.exps:
             raise Exception(f"del_exp(): Experiment {name} not found")
         self.exps.pop(name)
     @self.load
     def get_exp(self,name):
+        """
+        Called by View.set_exp(). Retrieves an Experiment from `self.exps`
+        """
         if name not in self.exps:
             raise Exception(f"get_exp(): Experiment {name} not found")
         return self.exps[name]
     @self.load
     def get_exps(self):
+        """
+        Return the dict of all expname->Experiment for all experiments in the project
+        """
         return self.exps
     @self.load()
     def cleanup(self):
+        """
+        See View.temp() for reference. Project.cleanup() clears all Experiments marked as temporary.
+        """
         for name,exp in self.exps.items():
             if exp.temp is True:
                 self.exps.pop(name)
@@ -340,11 +358,14 @@ class Project(SharedObject):
 
 # TODO a class decorator that add self.load() decorator to every function in a class, except for ones named in the class deco args (new and __init__)
 class Experiment(SharedObject):
-    def __init__(self,fs,mode,name,suggestor,hypers_config)
+    def __init__(self,fs,mode,name,suggestor,hypers_config):
         path = os.path.join(fs.root,EXPS_DIR)
         super().__init__(path,fs,mode,   name,suggestor,hypers_config) # gap indicates *args/**kwargs
     @self.lock()
     def new(self,name,suggestor,hypers_config):
+        """
+        New gets called when the Experiment instance is first instantiated, or what it gets wiped completely.
+        """
         super().new()
         self.name = name # exp name, which is how the user will refer to this exp
         self.suggestor = suggestor # a Suggestor object
@@ -355,9 +376,12 @@ class Experiment(SharedObject):
         self.active_sessions = [] # sess_ids that are actively being trained on
         self.closed_sessions = [] # close sess_ids (ie they finished their Suggestion)
         self.temp = False # True means this can will be deleted by Project.cleanup()
-        self.default_sess_config = None
+        self.default_sess_config = None # the first Session created will set this, and all future sessions will use it as a default config.
     @self.load()
     def del_sugg(self,sugg_id):
+        """
+        Called by View.del_sugg(). Deletes a suggestion (open or closed)
+        """
         if sugg_id in self.open_suggs:
             self.open_suggs.pop(sugg_id)
         elif sugg_id in self.closed_suggs:
@@ -366,22 +390,40 @@ class Experiment(SharedObject):
             raise Exception(f"del_sugg(): Suggestion {sugg_id} not found")
     @self.load()
     def get_open_suggs(self):
+        """
+        Return all open suggestions in a dict from sugg_id->Suggestion
+        """
         return self.open_suggs
     @self.load()
     def get_closed_suggs(self):
+        """
+        Return all closed suggestions in a dict from sugg_id->Suggestion
+        """
         return self.closed_suggs
     @self.load()
     def valid_sugg(self,sugg_id):
-        return (sugg_id in self.suggs)
+        """
+        Called by View.valid_sugg(). Checks if `sugg_id` is an open suggestion.
+        """
+        return (sugg_id in self.open_suggs)
     @self.load()
     def get_sugg(self):
+        """
+        Called by View.get_sugg(). Gets a new suggestion from the Suggestor.
+        """
         sugg = self.suggestor.get_sugg(self)
         return sugg
     @self.load()
     def flush_suggs(self):
+        """
+        Called by View.flush_suggs(). Clear all open suggestions.
+        """
         self.open_suggs = {}
     @self.load()
     def close_sugg(self,sugg_id,loss,stats):
+        """
+        Called by View.close_sugg(). Closes an open suggestion. The loss and stats get recorded by Suggestion.close() and the suggestion object gets moved to self.closed_suggs.
+        """
         if sugg_id not in self.open_suggs:
             raise Exception(f"close_sugg(): Suggestion {sugg_id} not in open_suggs")
         self.open_suggs[sugg_id].close(loss,stats)
@@ -390,8 +432,9 @@ class Experiment(SharedObject):
     @self.load()
     def new_sess(self,name,sess_config):
         """
-        Open a new session
-        `sess_config`: Config object
+        Create a new Session object. Sets `self.default_sess_config` if this is the first Session for the experiment. Adds the session id to `self.open_sessions`, and returns it.
+        `sess_config`: a Config object
+        Impl node: we only store session ids in self.open_sessions because the actual Session objects are huge since they contain the ML models, and if that were a local variable to us we would be writing it to disk constantly since we're a SharedObject.
         """
         if Session.get_id(self,name) in (self.open_sessions + self.closed_sessions):
             raise ValueError("This experiment alredy has a session by that name")
@@ -405,8 +448,15 @@ class Experiment(SharedObject):
 
     @self.load()
     def load_sess(self,name,config_override):
+        """
+        Called by View.load_sess(). Load a session object off of disk by name, and for any keys in the dict (NOT a Config) `config_override`, those key/value pairs will be overwritten in the loaded session's `.config`. If 'device' is in `config_override` then it will be used as the `map_location` keyword in torch.load so that the model in Session can be transferred to a new GPU if requested (can prevent crashes on loading a gpu-saved thing on a computer without a gpu for exmaple, by allowed you to load it onto the CPU. Or resuming a session but on a different GPU).
+        Impl node: we only store session ids in self.open_sessions because the actual Session objects are huge since they contain the ML models, and if that were a local variable to us we would be writing it to disk constantly since we're a SharedObject.
+        """
+        assert name not in self.active_sessions, "This session is already active"
+        assert name not in self.closed_sessions, "This session is already closed"
+        assert name in self.open_sessions, "This session does not exist in the list of open sessions"
         # this `config_override` is a partial config dict with just the things being overrided
-        path = os.path.join(fs.root,SESS_DIR)
+        path = os.path.join(fs.root,SESS_DIR,Session.get_id(self,name))
         map_location = config_override['device'] if 'device' in config_override else None
         sess = self.fs.load_nosplay(path,map_location=map_location)
         sess.config.update(config_override)
@@ -423,13 +473,15 @@ class Suggestion:
         self.loss = loss
         self.stats = stats
 
-def kwargs_of_strargs(args,conversion_dict=None):
+def kwargs_of_strargs(strargs,conversion_dict=None):
     """
-    Converts: "bins=3 test=2 another_value=hi some_val" to {'binds':3, 'test':2, 'another_value':'hi', some_val=True}
-    If conversion_dict = {'binds':int,'test':2} # the `str`s are implied
+    `strargs` are just a concise command line format for specifying key/value pairs for string keys and fairly simple values (ie values with no space characters in them). It looks like this:
+        At the command line: --hypers activation=tanh batch_size=16 super_cool_bool_option
+        This gets converted by argparse to args.hypers = ['activation=tanh' 'batch_size=16' 'super_cool_bool_option'] which is what `strargs` looks like as it enters this function. As you'd expect this function turns a strargs list into a kwargs dict.
+    `conversion_dict` is a str->type dict (e.g. 'batch_size':int). It's optional (in which case everything will be left as a str). You only need to include non-str things in the conversion_dict (though you're allowed to include strs as well for clarity).
     """
     res = {}
-    for arg in args:
+    for arg in strargs:
         if '=' not in arg:
             res[arg] = True
         else:
@@ -446,13 +498,14 @@ class Suggestor:
         raise NotImplementedError
 
 class SigoptSuggestor(Suggestor):
-    def __init__(self,args):
+    def __init__(self,strargs):
         super().__init__()
         conversion_dict = { # TODO write some way to say 'help' and get all these options
-                'token':str
-                'bandwidth':int
-                'budget':int
+                'token':str,
+                'bandwidth':int,
+                'budget':int,
                     }
+        kwargs = kwargs_of_strargs(strargs,conversion_dict)
     def get_sugg(self,exp):
         pass
 
@@ -623,92 +676,19 @@ class Session:
         pass
 
 
-    def __init__(self):
-        if config.join is not None:
-            session_dict = torch.load(fpath(config.join[0],'r'))
-            self._load(session_dict)
-            self.file = fpath(config.join[1],'w',config)
-            self.expname = expname(config.join[0])
-            util.purple(f"[--join] Joining existing experiment '{config.join[0]}' saving results to '{expname(self.file)}'")
-            self.mode = 'join' # must do after _load
-            if config.device == session_dict['raw']['config'].device:
-                util.red(f"Warning: device {config.device} is also being used by the experiment you are `--join`ing off of")
-            self.config = session.config_override(session_dict,config)
-            self.stats = Stats()
-            self.trainloop = False
-            self.has_suggestion = False
-            return
-        elif config.resume is not None:
-            util.green(f"[--resume] Resuming model '{config.resume[0]}'")
-            device = None
-            if len(config.resume) > 1:
-                device = torch.device(int(config.resume[1]) if (config.resume[1] != 'cpu') else 'cpu')
-                util.green(f"[--resume] Transferring model to {device}")
-            session_dict = torch.load(fpath(config.resume[0],'r'),map_location=device)
-            self._load(session_dict) # load attrs from old session
-            self.mode = 'resume' # must do after _load
-            self.config = session.config_override(session_dict,config)
-
-            if device is not None: # override with the [--resume filename [device]]
-                self.config.device = device
-
-            # only for 'resume' mode
-            if self.trainloop is True:
-                util.yellow("Previously halted in trainloop, loading state dicts")
-                self._old_state_dicts = session_dict['state_dicts']
-
-            self.stats = Stats(self.stats) # update stats to the newest version
-
-            if self.stats.curr_epoch >= self.config.epochs:
-                self.config.epochs = self.stats.curr_epoch + self.config.epochs
-                print(f"Auto-adjusting max epochs to {self.config.epochs}")
-            print(f"Model will run from epoch {self.stats.curr_epoch}->{self.config.epochs}")
-            return
-        elif config.del_exp is not None:
-            session_dict = torch.load(fpath(config.del_exp,'r'))
-            self._load(session_dict)
-            conn = sigopt_utils.Conn(self)
-            conn.del_exp()
-            util.green("deleted exp")
-            self.save()
-            exit(0)
-        elif config.del_sugg is not None:
-            session_dict = torch.load(fpath(config.del_sugg,'r'))
-            self._load(session_dict) # load attrs from old session
-            conn = sigopt_utils.Conn(self)
-            conn.del_sugg()
-            util.green("deleted suggestion")
-            self.save()
-            exit(0)
-        elif config.inspect is not None:
-            if config.inspect.endswith('.stats'):
-                stats = torch.load(fpath(config.inspect,'r'))
-                util.green('Loaded stats into `stats`')
-                breakpoint()
-                exit(0)
-            try:
-                session_dict = torch.load(fpath(config.inspect,'r'))
-            except:
-                session_dict = torch.load(fpath(config.inspect,'r'),map_location=torch.device('cpu'))
-            self._load(session_dict) # load attrs from old session
-            session = self
-            util.green('Loaded session into `self` and `session`')
-            breakpoint()
-            exit(0)
-        else:
-            if config.new is not None:
-                util.yellow(f"[--new] Creating new model named '{config.new}'")
-                self.file = fpath(config.new,'w',config)
-            else:
-                util.yellow(f"Creating new unsaved model")
-                self.file = None
-            self.expname = expname(self.file)
-            self.mode = 'new'
-            self.config = config
-            self.trainloop = False
-            self.has_suggestion = False
-            self.stats = Stats()
-            return
+"""
+if config.device == session_dict['raw']['config'].device:
+    util.red(f"Warning: device {config.device} is also being used by the experiment you are `--join`ing off of")
+"""
+"""
+if self.stats.curr_epoch >= self.config.epochs:
+    self.config.epochs = self.stats.curr_epoch + self.config.epochs
+    print(f"Auto-adjusting max epochs to {self.config.epochs}")
+print(f"Model will run from epoch {self.stats.curr_epoch}->{self.config.epochs}")
+"""
+"""
+make a 'creating new unsaved model'
+"""
 
     def _load(self,session_dict):
         for key,val in session_dict['raw'].items():
@@ -836,6 +816,13 @@ class CommonCase: # since multiline closures aren't pickleable but classes are
         return hypers_config[self.other_name].val
 
 class Hypers:
+    """
+    A set of hyperparameters generated by HypersConfig based on a Suggestion.
+    If a hyperparameter is named Fe_3 you can access it in any of these ways:
+        hypers.Fe_3
+        hypers['Fe_3']
+        hypers.bygroup('Fe',3)
+    """
     def __init__(self,params):
         for name,param in params.items():
             self[name] = param.val
@@ -843,11 +830,8 @@ class Hypers:
         return getattr(self,key)
     def __setitem__(self,key,val):
         setattr(self,key,val)
-    # TODO do a prettier thing than this
-    def get(self,key,layerno=None):
-        if layerno is not None:
-            return self[key+'_'+str(layerno)]
-        return self[key]
+    def bygroup(self,key,groupno):
+        return self[key+'_'+str(layerno)]
     def __repr__(self):
         body = []
         for k,v in self.__dict__.items():
@@ -1029,7 +1013,7 @@ class Stats:
         return self.policy.check_abort(self)
 
 """
-A policy embedded in `stats` for deciding when to end early. check_abort takes a Stats object and returns True if it should abort. This gets called at the end of trainloop right after stats.curr_epoch+=1 happens so curr_epoch == whatever the next epoch to be potentially run is.
+A policy embedded in a Session for deciding when to end early. check_abort takes a Stats object and returns True if it should abort. This gets called at the end of trainloop right after stats.curr_epoch+=1 happens so curr_epoch == whatever the next epoch to be potentially run is.
 """
 class Policy:
     def check_convergence(self):
