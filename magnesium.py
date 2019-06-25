@@ -2,6 +2,8 @@ import syncfs
 import torch
 import os
 from syncfs import SharedObject
+import util
+import argparse
 
 """
 Magnesium aims to be an ML manager that lets multiple processes work together, sharing knowledge about the results of using different hyperparameters etc. It's cool because you don't need to be running a server for it to work, instead every client works together to make sure they don't interfere with each other and they get the most up to date information. That's an impressive way of saying it's pretty much just a synchronous filesystem.
@@ -36,11 +38,23 @@ Basically you have a session which just holds you model, dataloaders, optimizer,
 
 """
 
+def typecast_of_typestr(s):
+    if s == 'int':
+        return int
+    if s == 'float':
+        return float
+    if s == 'bool':
+        return bool
+    return str
+
 PROJ_FILE = 'projectfile'
 EXPS_DIR =  'experiments'
 SESS_DIR =  'sessions'
 
 class Leaf:
+    def __init__(self,val):
+        self.val=val
+class StateDict:
     def __init__(self,val):
         self.val=val
 
@@ -57,17 +71,19 @@ class View:
     .sess: the current Session. This is the one thing that needs to be saved
     """
     def __init__(self,root):
-        self.fs = syncfs.SyncedFS(root)
-        self.proj = Project(self.fs,'any',name) # current Project
+        self.fs = syncfs.SyncedFS(root,'view')
+        self.proj = Project(self.fs,'any') # current Project
         self.exp = None # current Experiment
         self.sugg = None # current Suggestion
         self.sess = None # current Session
-    ## SESS CREATION/LOADING
+    ## SESS CREATION/LOADING/SAVING
     def new_sess(self,name,config):
         """
         Create a new Session from the given config dict, which must include all possible config keys to be valid.
         """
-        config = Config(config)
+        assert type(config) in (dict,Config)
+        if type(config) is dict:
+            config = Config(config)
         self.sess = self.exp.new_sess(name,config)
     def load_sess(self,name,config_override):
         """
@@ -77,6 +93,18 @@ class View:
         """
         self.sess = self.exp.load_sess(name,config_override)
         self.sugg = self.sess.sugg
+    def save(self,attr_str=None):
+        """
+        Save current Session to disk via syncfs. Optionally only save specific fields using attr_str (see SyncedFS.save)
+        """
+        self._assert_has_sess()
+        self.fs.save_nosplay(self.sess.build_save_dict(),self.sess.path)
+    def quicksave(self):
+        """
+        Same as `save` but excludes state dicts, speeding it up a lot
+        """
+        self._assert_has_sess()
+        self.save() # TODO make quicksave() actually exclude state dicts by using splay
 
     ## EXP CREATION/LOADING
     def new_exp(self,name,suggestor,hypersconfig):
@@ -85,7 +113,6 @@ class View:
         Will throw an error if an experiment by this name already exists.
         Sets current experiment to the new experiment.
         """
-        self._assert_has_exp()
         self.exp = self.proj.new_exp(name,suggestor,hypersconfig)
     def set_exp(self, name):
         """
@@ -106,6 +133,13 @@ class View:
         """
         self._assert_has_exp()
         self.exp.temp = True
+    def cleanup(self):
+        """
+        Deletes up all experiments marked with `temp()`
+        """
+        if self.exp is not None and self.exp.temp is True:
+            self.exp = None
+        self.proj.cleanup()
     ## SUGGESTIONS
     def get_sugg(self):
         """
@@ -163,24 +197,25 @@ class View:
 
         sess_config_kwargs = kwargs_of_strargs(mg_config.session,conversion_dict=sess_config_types)
         for kwarg in sess_config_kwargs:
-            assert kwargs != 'device', "device can only be specified as a positional argument in --new --join or --resume"
+            assert kwarg != 'device', "device can only be specified as a positional argument in --new --join or --resume"
             assert kwarg in get_default_sess_config().keys(), f"{kwarg} not in get_default_sess_config(), you should update it if this is a valid kwarg" 
             assert kwarg in allowed_sess_config[mode], f"--session argument {kwarg} is not allowed for --{mode}"
 
         if mode == 'new': ## --new
             expname,sessname,device = target
             util.yellow(f"[--new] Creating new experiment '{expname}' with session '{sessname}' on device '{device}'")
-            if mg_config.temp:
-                self.temp()
             suggestor = suggestor_by_name(mg_config.suggestor[0])(mg_config.suggestor[1:])
             hypersconfig = HypersConfig(mg_config.hypers)
             self.new_exp(expname,suggestor,hypersconfig) # new exp
+            if mg_config.temp:
+                self.temp()
 
             # building sess_config
             sess_config = get_default_sess_config()
             sess_config.update(sess_config_kwargs) # override defaults
             sess_config['device'] = device_of_str(device)
             self.new_sess(sessname,sess_config) # new sess
+            self.save()
 
         elif mode == 'join': ## --join
             expname,sessname,device = target
@@ -188,11 +223,12 @@ class View:
             self.set_exp(expname) # old exp
 
             # building sess_config
-            assert exp.defaults_sess_config is not None, "Can't join an experiment if no other Sessions have been started in it!"
-            sess_config = {k:v for k,v in exp.defaults_sess_config.items()} # deep enough copy
+            assert self.exp.default_sess_config is not None, "Can't join an experiment if no other Sessions have been started in it!"
+            sess_config = self.exp.default_sess_config.clone() # deep enough copy
             sess_config.update(sess_config_kwargs) # override defaults
             sess_config['device'] = device_of_str(device)
             self.new_sess(sessname,sess_config) # new sess
+            self.save()
 
         elif mode == 'resume': ## --resume
             if len(target) == 3: # a device was specified
@@ -206,6 +242,7 @@ class View:
 
             # loading sess
             self.load_sess(sessname,config_override=sess_config_kwargs) # old sess
+            self.save()
         elif mode == 'control': ## --control
             util.yellow(f"[--control] Entering control mode")
             pass
@@ -218,7 +255,10 @@ class View:
             raise ValueError("View has not been assigned an exp so you can't call exp operations on it")
     def _assert_has_sugg(self):
         if self.sugg is None:
-            raise ValueError("View has not been assigned a sugg so you can't call exp operations on it")
+            raise ValueError("View has not been assigned a sugg so you can't call sugg operations on it")
+    def _assert_has_sess(self):
+        if self.sess is None:
+            raise ValueError("View has not been assigned a sess so you can't call sess operations on it")
 
 #"""
 #VERY important. The rules for BoundObjects and mutating SharedObjects
@@ -239,56 +279,66 @@ class View:
 
 # a magnesium directory is a project
 class Project(SharedObject):
-    def __init__(self,fs,mode,name):
-        path = os.path.join(fs.root,PROJ_FILE)
-        super().__init__(path,fs,mode,    name)
-    @self.lock()
+    def __init__(self,fs,mode,name='newproject'):
+        """
+        `name` is the name to give the project IF you're creating a new project
+        """
+        super().__init__(PROJ_FILE,fs,mode,    name)
     def new(self,name):
         """
         The new() function gets called (by SharedObject.__init__ usually) when the shared object gets completely wiped and reset, and also the very first time it is created.
         """
-        super().new()
-        self.name = name # unique Experiment name
-        self.exps = {} # expname->Experiment dict with all experiments
-    @self.load
+        util.green("NEW PROJECT")
+        with self.lock():
+            super().new()
+            self.name = name # unique Experiment name
+            self.exps = {} # expname->Experiment dict with all experiments
+            if self.fs.isdir(EXPS_DIR):
+                self.fs.rmdir(EXPS_DIR,recursive=True)
+            if self.fs.isdir(SESS_DIR):
+                self.fs.rmdir(SESS_DIR,recursive=True)
+            self.fs.mkdir(EXPS_DIR)
+            self.fs.mkdir(SESS_DIR)
     def new_exp(self,name,suggestor,hypers_config):
         """
         Called by View.new_exp(). Creates a new Experiment and adds it to `self.exps`
         """
-        if name in self.exps:
-            raise ValueError(f"new_exp(): There is already an experiment named {name}")
-        self.exps[name] = Experiment(self.fs,'new',name,suggestor,hypers_config)
-        return self.exps[name]
-    @self.load
+        with self.load():
+            if name in self.exps:
+                raise ValueError(f"new_exp(): There is already an experiment named {name}")
+            # TODO right now we lazy-delete experiments then use `clean` to wipe them for real when a new experiment of the same name appears. This has benefits (ie lazy deletion means you can recover deleted files) but also dangers (ie if Projects.exps for some reason doesnt have an exp in it, then we can easily overwrite that exp)
+            self.exps[name] = Experiment(self.fs,'clean',name,suggestor,hypers_config)
+            return self.exps[name]
     def del_exp(self,name):
         """
         Called by View.del_exp(). Deletes an experiment by just poppin git from `self.exps`
+        (lazy deletion)
         """
-        if name not in self.exps:
-            raise Exception(f"del_exp(): Experiment {name} not found")
-        self.exps.pop(name)
-    @self.load
+        with self.load():
+            if name not in self.exps:
+                raise Exception(f"del_exp(): Experiment {name} not found")
+            self.exps.pop(name)
     def get_exp(self,name):
         """
         Called by View.set_exp(). Retrieves an Experiment from `self.exps`
         """
-        if name not in self.exps:
-            raise Exception(f"get_exp(): Experiment {name} not found")
-        return self.exps[name]
-    @self.load
+        with self.load():
+            if name not in self.exps:
+                raise Exception(f"get_exp(): Experiment {name} not found")
+            return self.exps[name]
     def get_exps(self):
         """
         Return the dict of all expname->Experiment for all experiments in the project
         """
         return self.exps
-    @self.load()
     def cleanup(self):
         """
         See View.temp() for reference. Project.cleanup() clears all Experiments marked as temporary.
         """
-        for name,exp in self.exps.items():
-            if exp.temp is True:
-                self.exps.pop(name)
+        with self.load():
+            for name,exp in list(self.exps.items()):
+                if exp.temp is True:
+                    self.exps.pop(name)
 
 
 ## boundobjects were a failure. Well they were successful but not dependable enough and not a nice enough interface
@@ -356,111 +406,106 @@ class Project(SharedObject):
 #    def __init__(self,parent,name):
 #        super().__init__(parent,name,{})
 
-# TODO a class decorator that add self.load() decorator to every function in a class, except for ones named in the class deco args (new and __init__)
 class Experiment(SharedObject):
     def __init__(self,fs,mode,name,suggestor,hypers_config):
-        path = os.path.join(fs.root,EXPS_DIR)
-        super().__init__(path,fs,mode,   name,suggestor,hypers_config) # gap indicates *args/**kwargs
-    @self.lock()
+        relpath = os.path.join(EXPS_DIR,name)
+        super().__init__(relpath,fs,mode,   name,suggestor,hypers_config) # gap indicates *args/**kwargs
     def new(self,name,suggestor,hypers_config):
         """
         New gets called when the Experiment instance is first instantiated, or what it gets wiped completely.
         """
-        super().new()
-        self.name = name # exp name, which is how the user will refer to this exp
-        self.suggestor = suggestor # a Suggestor object
-        self.hypers_config = hypers_config # a HypersConfig object
-        self.open_suggs = {} # open Suggestion objects
-        self.closed_suggs = {} # closed Suggestion objects (ie loss has been reported)
-        self.open_sessions = [] # open sess_ids (includes ones that aren't actively running). We don't store the actual Session object bc thats huge and stored/updated separately. We only store the ids here.
-        self.active_sessions = [] # sess_ids that are actively being trained on
-        self.closed_sessions = [] # close sess_ids (ie they finished their Suggestion)
-        self.temp = False # True means this can will be deleted by Project.cleanup()
-        self.default_sess_config = None # the first Session created will set this, and all future sessions will use it as a default config.
-    @self.load()
+        with self.lock():
+            super().new()
+            self.name = name # exp name, which is how the user will refer to this exp
+            self.suggestor = suggestor # a Suggestor object
+            self.hypers_config = hypers_config # a HypersConfig object
+            self.open_suggs = {} # open Suggestion objects
+            self.closed_suggs = {} # closed Suggestion objects (ie loss has been reported)
+            self.open_sessions = [] # open sess_ids (includes ones that aren't actively running). We don't store the actual Session object bc thats huge and stored/updated separately. We only store the ids here.
+            self.active_sessions = [] # sess_ids that are actively being trained on
+            self.closed_sessions = [] # close sess_ids (ie they finished their Suggestion)
+            self.temp = False # True means this can will be deleted by Project.cleanup()
+            self.default_sess_config = None # the first Session created will set this, and all future sessions will use it as a default config.
     def del_sugg(self,sugg_id):
         """
         Called by View.del_sugg(). Deletes a suggestion (open or closed)
         """
-        if sugg_id in self.open_suggs:
-            self.open_suggs.pop(sugg_id)
-        elif sugg_id in self.closed_suggs:
-            self.closed_suggs.pop(sugg_id)
-        else:
-            raise Exception(f"del_sugg(): Suggestion {sugg_id} not found")
-    @self.load()
+        with self.load():
+            if sugg_id in self.open_suggs:
+                self.open_suggs.pop(sugg_id)
+            elif sugg_id in self.closed_suggs:
+                self.closed_suggs.pop(sugg_id)
+            else:
+                raise Exception(f"del_sugg(): Suggestion {sugg_id} not found")
     def get_open_suggs(self):
         """
         Return all open suggestions in a dict from sugg_id->Suggestion
         """
         return self.open_suggs
-    @self.load()
     def get_closed_suggs(self):
         """
         Return all closed suggestions in a dict from sugg_id->Suggestion
         """
         return self.closed_suggs
-    @self.load()
     def valid_sugg(self,sugg_id):
         """
         Called by View.valid_sugg(). Checks if `sugg_id` is an open suggestion.
         """
         return (sugg_id in self.open_suggs)
-    @self.load()
     def get_sugg(self):
         """
         Called by View.get_sugg(). Gets a new suggestion from the Suggestor.
         """
         sugg = self.suggestor.get_sugg(self)
         return sugg
-    @self.load()
     def flush_suggs(self):
         """
         Called by View.flush_suggs(). Clear all open suggestions.
         """
         self.open_suggs = {}
-    @self.load()
     def close_sugg(self,sugg_id,loss,stats):
         """
         Called by View.close_sugg(). Closes an open suggestion. The loss and stats get recorded by Suggestion.close() and the suggestion object gets moved to self.closed_suggs.
         """
-        if sugg_id not in self.open_suggs:
-            raise Exception(f"close_sugg(): Suggestion {sugg_id} not in open_suggs")
-        self.open_suggs[sugg_id].close(loss,stats)
-        self.close_suggs[sugg_id] = self.open_suggs.pop(sugg_id)
+        with self.load():
+            if sugg_id not in self.open_suggs:
+                raise Exception(f"close_sugg(): Suggestion {sugg_id} not in open_suggs")
+            self.open_suggs[sugg_id].close(loss,stats)
+            self.close_suggs[sugg_id] = self.open_suggs.pop(sugg_id)
 
-    @self.load()
     def new_sess(self,name,sess_config):
         """
         Create a new Session object. Sets `self.default_sess_config` if this is the first Session for the experiment. Adds the session id to `self.open_sessions`, and returns it.
         `sess_config`: a Config object
         Impl node: we only store session ids in self.open_sessions because the actual Session objects are huge since they contain the ML models, and if that were a local variable to us we would be writing it to disk constantly since we're a SharedObject.
         """
-        if Session.get_id(self,name) in (self.open_sessions + self.closed_sessions):
-            raise ValueError("This experiment alredy has a session by that name")
-        if self.default_sess_config is None:
-            assert len(self.open_sessions + self.closed_sessions) == 0
-            # this is our first session so we use its args as default for all future sessions
-            self.default_sess_config = sess_config.clone()
-        sess = Session(name,sess_config,self.name)
-        self.open_sessions.append(sess.id)
-        return sess
+        with self.load():
+            if Session.get_id(self,name) in (self.open_sessions + self.closed_sessions):
+                raise ValueError("This experiment alredy has a session by that name")
+            if self.default_sess_config is None:
+                assert len(self.open_sessions + self.closed_sessions) == 0
+                # this is our first session so we use its args as default for all future sessions
+                self.default_sess_config = sess_config.clone()
+            sess = Session(name,self.name,sess_config=sess_config)
+            self.open_sessions.append(sess.id)
+            return sess
 
-    @self.load()
     def load_sess(self,name,config_override):
         """
         Called by View.load_sess(). Load a session object off of disk by name, and for any keys in the dict (NOT a Config) `config_override`, those key/value pairs will be overwritten in the loaded session's `.config`. If 'device' is in `config_override` then it will be used as the `map_location` keyword in torch.load so that the model in Session can be transferred to a new GPU if requested (can prevent crashes on loading a gpu-saved thing on a computer without a gpu for exmaple, by allowed you to load it onto the CPU. Or resuming a session but on a different GPU).
         Impl node: we only store session ids in self.open_sessions because the actual Session objects are huge since they contain the ML models, and if that were a local variable to us we would be writing it to disk constantly since we're a SharedObject.
         """
-        assert name not in self.active_sessions, "This session is already active"
-        assert name not in self.closed_sessions, "This session is already closed"
-        assert name in self.open_sessions, "This session does not exist in the list of open sessions"
-        # this `config_override` is a partial config dict with just the things being overrided
-        path = os.path.join(fs.root,SESS_DIR,Session.get_id(self,name))
-        map_location = config_override['device'] if 'device' in config_override else None
-        sess = self.fs.load_nosplay(path,map_location=map_location)
-        sess.config.update(config_override)
-        return sess
+        with self.load():
+            assert Session.get_id(self,name) not in self.active_sessions, "This session is already active"
+            assert Session.get_id(self,name) not in self.closed_sessions, "This session is already closed"
+            assert Session.get_id(self,name) in self.open_sessions, "This session does not exist in the list of open sessions"
+            # this `config_override` is a partial config dict with just the things being overrided
+            path = Session.get_path(self,name)
+            map_location = config_override['device'] if 'device' in config_override else None
+            save_dict = self.fs.load_nosplay(path,map_location=map_location)
+            sess = Session(name,self.name,save_dict=save_dict)
+            sess.config.update(config_override)
+            return sess
 
 
 class Suggestion:
@@ -492,8 +537,15 @@ def kwargs_of_strargs(strargs,conversion_dict=None):
         for k,conversion in conversion_dict.items():
             if k in res:
                 res[k] = conversion(res[k])
+    return res
 
 class Suggestor:
+    def get_sugg(self,exp):
+        raise NotImplementedError
+
+class RandomSuggestor(Suggestor):
+    def __init__(self,strargs):
+        super().__init__()
     def get_sugg(self,exp):
         raise NotImplementedError
 
@@ -506,8 +558,11 @@ class SigoptSuggestor(Suggestor):
                 'budget':int,
                     }
         kwargs = kwargs_of_strargs(strargs,conversion_dict)
+        self.token = kwargs['token']
+        self.budget = kwargs['budget']
+        self.bandwidth = kwargs['bandwidth']
     def get_sugg(self,exp):
-        pass
+        raise NotImplementedError
 
 class SigoptExperiment(Experiment):
     pass
@@ -524,20 +579,20 @@ def device_of_str(s):
 def get_arguments():
     parser = argparse.ArgumentParser(description='MPNN for J-Coupling Kaggle competition')
     ## Exclusive arguments (must use exactly one of them)
-    parser.add_argument('--new', metavar='expname sessname device', nargs='+',
+    parser.add_argument('--new', metavar='expname sessname device', nargs=3,type=str,
                         help='Start a new experiment (and a new session) using the specified names on the specified device')
-    parser.add_argument('--join', metavar='expname sessname device', nargs='+',
+    parser.add_argument('--join', metavar='expname sessname device', nargs=3, type=str,
                         help='Join an existing experiment in a new session using the specified names. Provide a device to run on as well. Use --session with this to override values like number of workers, otherwise these values will be pulled from experiment defaults (which are set during --new)')
-    parser.add_argument('--resume', metavar='expname sessname [device]',  nargs='+',
+    parser.add_argument('--resume', metavar='expname sessname [device]',  nargs='+', type=str,
                         help='Resume an experiment. Restarts at the last epoch. Optionally provide a device as well, which is just an abbreviated form of adding --session device=#. Use --session to override other values.')
-    parser.add_argument('--control', action='store_true', # we set default to None not False so that `exclusive_options` works below (tho actually it prob works anyways since False+False==0).
+    parser.add_argument('--control', action='store_true',default=None, # we set default to None not False so that `exclusive_options` works below (tho actually it prob works anyways since False+False==0).
                         help='Enter the control console for the project')
     ## Non-exclusive arguments
-    parser.add_argument('--suggestor', nargs='+',
+    parser.add_argument('--suggestor', nargs='+', type=str,
                         help='Only used with --new. Enter the suggestor type followed by any arguments for the suggestor (no internal "--", use "=" between key and value, and no spaces within a key/value pair). Example: --suggestor sigopt token=REAL bandwidth=4 budget=1000')
-    parser.add_argument('--hypers', nargs='+',
+    parser.add_argument('--hypers', nargs='+',default=[], type=str,
                         help='Only used with --new. Enter any hypers you want to overrides the defaults for (no internal "--", use "=" between key and value, and no spaces within a key/value pair). Example: --hypers bins=20 message_len=160')
-    parser.add_argument('--session', nargs='+',
+    parser.add_argument('--session', nargs='+',default=[], type=str,
                         help='Used with --new, --join, or --resume. Enter any session arguments you want to override the default (for --new) or existing (for --join and --resume, though there is only a limited subset that are allowed in this case) values of (no internal "--", use "=" between key and value, and no spaces within a key/value pair). Example: --session workers=3 no_shuffle=True')
     parser.add_argument('--temp', action='store_true',default=False,
                         help='For use with `new` to create a temp project')
@@ -547,17 +602,21 @@ def get_arguments():
 
     # Validity assertions
     exclusive_options = ['new','join','resume','control']
-    selected_opt = getattr(mg_config,x) is not None for x in exclusive_options] # there should be one True in here at the index in exclusive_options for the option that was selected
-    assert sum(selected_opt) == 1, f"You must provide exactly one of the options: {exclusive_options}"
-    mg_config.target = exclusive_option[selected_opt.index(True)] # the args for whatever the selected option was
+    selected_opt = [getattr(mg_config,x) is not None for x in exclusive_options] # there should be one True in here at the index in exclusive_options for the option that was selected
+    if sum(selected_opt) != 1:
+        parser.print_help()
+        util.red(f"You must provide exactly one of the options: {exclusive_options}")
+        exit(1)
+    targetname = exclusive_options[selected_opt.index(True)]
+    mg_config.target = getattr(mg_config,targetname) # the args for whatever the selected option was
     if mg_config.new:
-        mg_config.mode == 'new'
+        mg_config.mode = 'new'
     elif mg_config.join:
-        mg_config.mode == 'join'
+        mg_config.mode = 'join'
     elif mg_config.resume:
-        mg_config.mode == 'resume'
+        mg_config.mode = 'resume'
     elif mg_config.control:
-        mg_config.mode == 'control'
+        mg_config.mode = 'control'
     else:
         raise Exception("Unrecognized mode")
 
@@ -565,13 +624,20 @@ def get_arguments():
         assert mg_config.new is not None, "If you provide --suggestor you must be starting a --new experiment"
     if mg_config.temp is True:
         assert mg_config.new is not None, "If you provide --temp you must be starting a --new experiment"
-    if mg_config.hypers is not None:
+    if mg_config.hypers != []:
         assert mg_config.new is not None, "If you provide --hypers you must be starting a --new experiment"
+
+    if mg_config.new is not None:
+        assert mg_config.suggestor is not None, "--new requires a Suggestor to be defined with --suggestor"
+    if mg_config.resume is not None:
+        assert len(mg_config.resume) in (2,3)
 
     return mg_config
 
 
 def suggestor_by_name(name):
+    if name == 'random':
+        return RandomSuggestor
     if name == 'sigopt':
         return SigoptSuggestor
     raise NotImplementedError
@@ -593,7 +659,7 @@ class Config:
             assert k in get_default_sess_config().keys()
             self[k] = v
     def clone(self):
-        return Config(self.__items__)
+        return Config(self.__dict__)
 
 
 
@@ -613,7 +679,7 @@ sess_config_types = {key:type(val) for key,val in get_default_sess_config().item
 
 # --session args allowed for --resume --join and --new
 allowed_sess_config = {
-        'new': default_sess_config.keys(),
+        'new': get_default_sess_config().keys(),
         'join': ['workers','print_net','device','epochs'],
         'resume': ['workers','print_net','device','epochs'],
         }
@@ -636,44 +702,118 @@ class Session:
     Because they are accessed so frequently and involve a large amount of data, these are not SharedObjects. We wouldn't gain much from SharedObjects and it would make for lots of extra boilerplate, unreliability, and slowdowns.
 
     You can add arbitrary fields to the Session object at runtime and they'll get properly saved (you may have to modify the splay() function if torch.save isn't able to save them or you don't want to save them)
+
+    Attributes:
+        .name
+        .id
+        .expname
+        .path
+        .config
+        .model
+        .optimizer
+        .scheduler
+        .stats
+        .sugg
+        .hypers
+
     """
-    def __init__(self,name,sess_config,expname):
-        assert isinstance(exp,Experiment)
-        assert isinstance(sess_config,Config)
+    def __init__(self,name,expname,sess_config=None,save_dict=None):
+        """
+        Note that __init__ will be run during Session loading in addition to session creation.
+        Provide either sess_config (for new session) or save_dict (for loading).
+        """
+        assert (sess_config is None) ^ (save_dict is None)
+        if sess_config is not None:
+            assert isinstance(sess_config,Config)
         self.name = name # a name unique within the experiment but not between experiments
-        self.expname = exp.name
-        self.id = Session.get_id(exp,name) # an identifier unique within the project
-        self.config = sess_config
+        self.expname = expname
+        self.id = Session.get_id(expname,name) # an identifier unique within the project
+        self.path = Session.get_path(expname,name)
         self.model = None
         self.optimizer = None
         self.scheduler = None
         self.stats = None
         self.sugg = None
         self.hypers = None
+        self.blacklist = [] # things we wont save to disk at all
 
-    def save(self,attr_str=None):
+        if sess_config is not None:
+            self.config = sess_config
+        if save_dict is not None:
+            self.load_save_dict(save_dict)
+    def build_save_dict(self):
         """
-        Save yourself to disk via syncfs. Optionally only save specific fields using attr_str (see SyncedFS.save)
+        Returns a dict of attrs to be saved (shallow simple dict, not nested like splay tree or anything)
+        We will skip anything in `self.blacklist` so do self.blacklist.append() if you want to add something to that on the fly.
+        Anything with a .state_dict attribute will be saved as a state dict and wrapped in a StateDict() type (just to differentiate it from normal dicts when loading)
         """
-        pass
-    def quicksave(self):
-        """
-        Same as `save` but excludes state dicts, speeding it up a lot
-        """
-        pass
+        save_dict = {}
+        for k,v in self.__dict__.items():
+            if k in self.blacklist:
+                continue
+            if hasattr(v,'state_dict'):
+                v = StateDict(v.state_dict()) # wrap
+            save_dict[k] = v
+        return save_dict
+
+    def load_save_dict(self,save_dict):
+        assert save_dict['id'] == self.id
+        for k,v in save_dict.items():
+            if type(v) is StateDict:
+                v = v.val # unwrap
+            self[k] = v
+
     @staticmethod
-    def get_id(exp,name):
+    def get_path(exp_or_expname,sessname):
+        return os.path.join(SESS_DIR,Session.get_id(exp_or_expname,sessname))
+    @staticmethod
+    def get_id(exp_or_expname,sessname):
         """
         Returns a unique identifier within the Project. Note that Session.name alone is not unique.
+        Takes `exp` = Experiment | str
         """
-        return f"{exp.name}_{name}"
-    @staticmethod
-    def load(exp,name):
-        """
-        Load a session from disk
-        """
-        id = Session.get_id(exp,name)
-        pass
+        if type(exp_or_expname) == str:
+            return f"{exp_or_expname}_{sessname}"
+        return f"{exp_or_expname.name}_{sessname}"
+
+#    def load_state_dicts(self):
+#        """
+#        Load model/optimizer/scheduler state dicts if we're resuming an old session
+#        """
+#        for key,val in self._old_state_dicts.items():
+#            self[key].load_state_dict(val)
+#        del self._old_state_dicts # so we don't save it again and take up a ton of space
+
+    def __getitem__(self,key):
+        return getattr(self,key)
+    def __setitem__(self,key,val):
+        return setattr(self,key,val)
+    def __repr__(self):
+        body = []
+        for k,v in self.__dict__.items():
+            body.append(f"{k}={v}")
+        body = '\n'+'\n'.join(body)+'\n'
+        return f"Session({body})"
+
+#    def save(self):
+#        """
+#        Save everything!
+#        """
+#        blacklist = ['train_loader','valid_loader','test_loader','conn', 'plt','policy']
+#        if self.file is None:
+#            return
+#        session_dict = {'raw':{}, 'state_dicts':{}}
+#        for k,v in self.__dict__.items():
+#            if k in blacklist:
+#                continue
+#            if hasattr(v,'state_dict'):
+#                session_dict['state_dicts'][k] = v.state_dict()
+#            else:
+#                session_dict['raw'][k] = v
+#        util.gray(f"saving raw: {list(session_dict['raw'].keys())}")
+#        torch.save(session_dict,f"{self.file}")
+#        torch.save(self.stats,f"{self.file}.stats")
+#        util.gray(f"[saved to {self.file}]")
 
 
 """
@@ -689,71 +829,6 @@ print(f"Model will run from epoch {self.stats.curr_epoch}->{self.config.epochs}"
 """
 make a 'creating new unsaved model'
 """
-
-    def _load(self,session_dict):
-        for key,val in session_dict['raw'].items():
-            self[key] = val
-
-    def load_state_dicts(self):
-        """
-        Load model/optimizer/scheduler state dicts if we're resuming an old session
-        """
-        for key,val in self._old_state_dicts.items():
-            self[key].load_state_dict(val)
-        del self._old_state_dicts # so we don't save it again and take up a ton of space
-
-    def __getitem__(self,key):
-        return getattr(self,key)
-    def __setitem__(self,key,val):
-        return setattr(self,key,val)
-    def __repr__(self):
-        body = []
-        for k,v in self.__dict__.items():
-            body.append(f"{k}={v}")
-        body = '\n'+'\n'.join(body)+'\n'
-        return f"session({body})"
-
-    def save(self):
-        """
-        Save everything!
-        """
-        blacklist = ['train_loader','valid_loader','test_loader','conn', 'plt','policy']
-        if self.file is None:
-            return
-        session_dict = {'raw':{}, 'state_dicts':{}}
-        for k,v in self.__dict__.items():
-            if k in blacklist:
-                continue
-            if hasattr(v,'state_dict'):
-                session_dict['state_dicts'][k] = v.state_dict()
-            else:
-                session_dict['raw'][k] = v
-        util.gray(f"saving raw: {list(session_dict['raw'].keys())}")
-        torch.save(session_dict,f"{self.file}")
-        torch.save(self.stats,f"{self.file}.stats")
-        util.gray(f"[saved to {self.file}]")
-
-    @staticmethod
-    def config_override(oldsession_dict, newconfig):
-        """
-        Overrides certain fields in `oldsession.config` using ones from `newconfig` as specified in `newconfig.override` and `newconfig.override_all`
-        Note that in reality we actually copy all fields from `old` into `new` as long as override is not specified. This allows better compatibility with fields added to the program that are present in newconfig but not oldconfig.
-        """
-        oldconfig = oldsession_dict['raw']['config']
-        if newconfig.device != torch.device(0): # TODO this should be generally done for all nondefault things. Maybe argparse has a way to telling which args were specified and which werent. otherwise just do it for the things that no longer match whatever their default was
-            newconfig.override.append('device')
-        newconfig.override.append('override')
-        newconfig.override.append('override_all')
-        if newconfig.override_all:
-            return newconfig
-        for key in oldconfig.__dict__:
-            if key not in newconfig.override:
-                setattr(newconfig,key,getattr(oldconfig,key))
-            else:
-                util.yellow(f"overriding {key}")
-        return newconfig
-
-
 
 
 """
@@ -811,8 +886,8 @@ class CommonCase: # since multiline closures aren't pickleable but classes are
         self.other_name = other_name
         self.name = name
     def __call__(self,hypers_config):
-        assert self.other_name in hypers.keys, f"Unable to derive `{self.name}` from value `{self.other_name}` because `{self.other_name}` not found in the hypers list"
-        assert hypers.keys.index(self.other_name) < hypers.keys.index(self.name),"{self.name} is derived from {self.other_name} but is defined before {self.other_name}! Please move the derived value after the source value"
+        assert self.other_name in hypers_config.params, f"Unable to derive `{self.name}` from value `{self.other_name}` because `{self.other_name}` not found in the hypers_config list"
+        assert list(hypers_config.params.keys()).index(self.other_name) < list(hypers_config.params.keys()).index(self.name),"{self.name} is derived from {self.other_name} but is defined before {self.other_name}! Please move the derived value after the source value"
         return hypers_config[self.other_name].val
 
 class Hypers:
@@ -831,7 +906,7 @@ class Hypers:
     def __setitem__(self,key,val):
         setattr(self,key,val)
     def bygroup(self,key,groupno):
-        return self[key+'_'+str(layerno)]
+        return self[key+'_'+str(groupno)]
     def __repr__(self):
         body = []
         for k,v in self.__dict__.items():
@@ -859,7 +934,7 @@ def get_default_params():
         Param('dropout',min=.1,max=.5,type='float',default=.2),
 
         ## MPNN shapes
-        Param('Fv_0',default=dataset.natoms,tunable=False),
+        Param('Fv_0',default=5,tunable=False), # dataset.natoms == 5
         Param('Fv',min=25,max=200,default=100),
         Param('Fe_0',derive_fn='gauss_bins'),
         Param('Fe',min=25,max=200,default=100),
@@ -874,14 +949,6 @@ def get_default_params():
         ]
 param_type_dict = {param.name:param.type_cast for param in get_default_params()}
 
-def typecast_of_typestr(s):
-    if s == 'int':
-        return int
-    if s == 'float':
-        return float
-    if s == 'bool':
-        return bool
-    return str
 
 """
 Be sure to call hypers.finalize() before using any hypers if you manually change things around. Finalize() is automatically called for you: 1) at the end of __init__, 2) at the start of get_sigopt_parameters, and 3) at the end of assign_parameters.
@@ -1049,6 +1116,36 @@ class PlateauPolicy(Policy):
                 return False
         return True
 
+
+def new_test():
+    v = View('mg')
+    #v.cleanup() # wipe all exps since we're just testing how it is to create a new one
+    v.parse_args()
+
+
+from contextlib import contextmanager
+
+import pdb
+import traceback
+import sys
+@contextmanager
+def debug(do_debug):
+    try:
+        yield None
+    except Exception as e:
+        if do_debug:
+            print(''.join(traceback.format_exception(e.__class__,e,e.__traceback__)))
+            print(util.format_exception(e,''))
+            pdb.post_mortem()
+            sys.exit(1)
+        else:
+            raise e
+    finally:
+        pass
+
+if __name__ == '__main__':
+    with debug(True):
+        new_test()
 
 
 

@@ -9,10 +9,13 @@ from collections import namedtuple
 from contextlib import contextmanager
 import util
 
-
 import pdb
 import traceback
 import sys
+
+
+#TODO REWRITE USING THESE PATH OBJECTS https://docs.python.org/3/library/pathlib.html
+
 @contextmanager
 def debug(do_debug):
     try:
@@ -29,14 +32,13 @@ def debug(do_debug):
         pass
 
 
-
-
 # absolute path to file, absolute path to lockfile for the file, absolute path to guard file for the lockfile
-Paths = namedtuple('Paths','absolute lock guard')
+Paths = namedtuple('Paths','absolute lock guard relative')
 LockMsg = namedtuple('LockMsg','pid time name')
 
 EXPIRATION_TIMEOUT = 10 # seconds till a lock expires
-GUARD_EXTENSION = '.lockguard'
+GUARD_EXTENSION = '.fslockguard'
+LOCK_EXTENSION = '.fslock'
 
 # TODO rewrite Locks as their own class to clean up SyncedFS
 
@@ -50,38 +52,32 @@ Most other paths are absolute.
 
 """
 
-
-
 class SyncedFS:
     """
     A Synchronized filesystem.
+
+    self.root is the location of the root of the filesystem (absolute). `root` provided doesnt have to be absolute tho.
+    self.lockeddir is the location of the .fslock folder where the lock based mirror of the filesystem will be kept (inside root)
+
+    When you lock the directory mg/foo/bar/ you first create the file mg/.fslock/foo/bar.lock any anyone who _try_lock()s on anything prefixed with mg/foo/bar will fail. Meanwhile you take locks on every file/folder under mg/foo/bar recursively. Taking foo/bar.lock functions like a writer lock in a rwlock system
+
+    `with locks()` should let you take mult locks, which is careful to avoid deadlocking with other ppl by giving up early. Note that starvation is possible especially if you take a lot of locks in the way, and taking a directory lock will avoid this.
+
     """
     def __init__(self,root,name,verbose=False):
         # we make these local here so you cant accidently use them outside
-        LOCKDIR = '.fslock/'
-        SHAREDDIR = '.sharedobjs/'
-        LOCKED_DIR_LIST = 'lockeddirlist'
         self.name = name # a name that all your locks will be tagged with
         assert ' ' not in self.name
         # root dir ends with '/'
-        if root[-1] != '/':
+        root = os.path.realpath(root)
+        if root[-1] != '/': # IMP to do this after `realpath`
             root += '/'
         self.root = root
-        if not isdir(root):
+        if not isdir(self.root):
             raise ValueError(f"Root directory {root} not found")
 
-        self.lockdir = join(root,LOCKDIR)
-        if not isdir(self.lockdir):
-            mkdir(self.lockdir)
-        self.lockeddirlist = join(self.lockdir,LOCKED_DIR_LIST)
-        if not isfile(self.lockeddirlist):
-            open(self.lockeddirlist,'w').close().close()
-        self.shareddir = join(self.root,SHAREDDIR)
-        if not isdir(self.shareddir):
-            mkdir(self.shareddir)
-
-        self.locks = {}
-        self.lock_count = {}
+        self.lock_time = {}  # lockpath -> [time that it was created]
+        self.lock_count = {} # lockpath -> [number of locks you're holding on that path (ie recursive lock() calls)]
         self.verbose = verbose
 
         if self.verbose: print("new SyncedFS created")
@@ -95,96 +91,113 @@ class SyncedFS:
         f.write(new_values)
     """
     @contextmanager
-    def open(self,fpath,*args,**kwargs):
+    def open(self,fpath,*args,metafile=False,**kwargs):
         if self.verbose: print("open() wrapper called")
+        if not metafile and self.ismetafile(fpath):
+            raise ValueError(f"{fpath} is a path to a metafile. Use metafile=True to confirm that you are trying to open a file used internally by the FS")
         with self.lock(fpath):
-            yield open(self.get_paths(fpath).absolute,*args,**kwargs)
+            yield open(self.absolute(fpath),*args,**kwargs) # by using yield we let the `open` contextmanager also do its thing
 
-    def get_shared_obj(self,name):
-        return SharedObject(join(self.shareddir,name),self)
-
-    def remove(self,fpath):
-        if self.verbose: print("remove() wrapper called")
-        with self.lock(fpath):
-            os.remove(self.get_paths(fpath).absolute)
-
-    def makedirs(self,fpath):
-        makedirs(self.get_paths(fpath).absolute)
-
-    def mkdir(self,fpath,locked=False):
-        """
-        If `locked` is True then in the lockdir this will be a file rather than a directory, and thus there will be no locks within it (since its a file not a directory). Any reads/writes to anything inside this folder will have to take this single masterlock on the directory
-        """
+    def remove(self,fpath,metafile=False):
         abspath = self.get_paths(fpath).absolute
-        mkdir(abspath) # we mkdir first in case it fails
-        if locked is True:
-            self._add_lockeddir(abspath)
+        if self.verbose: print("remove() wrapper called")
+        if not metafile and self.ismetafile(fpath):
+            raise ValueError(f"{fpath} is a path to a metafile. Use metafile=True to confirm that you are trying to remove a file used internally by the FS")
+        with self.lock(fpath):
+            os.remove(self.absolute(fpath))
 
-    def rmdir(self,fpath):
-        with self.lock(fpath,no_error_on_dir=True):
-            rmdir(self.get_paths(fpath).absolute)
+    def makedirs(self,fpath): # TODO (nonurgent) modify to use locking
+        makedirs(self.absolute(fpath))
+
+    def mkdir(self,fpath):
+        abspath = self.get_paths(fpath).absolute
+        if self.ismetafile(fpath):
+            raise ValueError(f"{fpath} is a path to a metafile, you can't make a directory with this reserved name")
+        with self.lock(fpath):
+            mkdir(abspath)
+
+    def isdir(self,fpath):
+        return os.path.isdir(self.get_paths(fpath).absolute)
+    def isfile(self,fpath):
+        return os.path.isfile(self.get_paths(fpath).absolute)
+    def ismetafile(self,fpath):
+        abspath = self.get_paths(fpath).absolute
+        return (abspath.endswith(LOCK_EXTENSION) or abspath.endswith(GUARD_EXTENSION))
+    def absolute(self,fpath):
+        return self.get_paths(fpath).absolute
+
+    def listdir(self,fpath,metafile=False,type=None):
+        all_files = os.listdir(self.absolute(fpath))
+        if type == 'dir':
+            all_files = list(filter(self.isdir, all_files))
+        elif type == 'file':
+            all_files = list(filter(self.isfile, all_files))
+        if metafile: # include metafiles in results
+            return all_files
+        return list(filter(lambda f: not self.ismetafile(f), all_files)) # strip out metafiles
+
+    def wipe(self,dir=''):
+        if dir == '':
+            if self.verbose: util.blue('wipe start')
+            self.unlock_all()
+        for item in self.listdir(dir):
+            to_delete = join(self.root,dir,item)
+            if self.verbose: util.blue(f"wiping {to_delete}")
+            assert to_delete.startswith(self.root)
+            assert to_delete.startswith(os.environ['HOME']) # im just really scared of deleting '/' somehow
+            if self.isfile(to_delete):
+                self.remove(to_delete)
+            if self.isdir(to_delete):
+                self.wipe(dir=to_delete)
+                self.rmdir(to_delete)
+        if dir == '':
+            self.lock_time = {}
+            self.lock_count = {}
+            if self.verbose: util.blue('wipe end')
+
+    def unlock_all(self,dir=''):
+        for item in self.listdir(dir,metafile=True):
+            to_delete = join(self.root,dir,item)
+            if self.isdir(to_delete): # recurse on contents of dirs
+                self.unlock_all(dir=to_delete)
+            if not self.ismetafile(to_delete):
+                continue # dont delete anything except metafiles
+            assert to_delete.startswith(self.root)
+            assert to_delete.startswith(os.environ['HOME']) # im just really scared of deleting '/' somehow
+            self.remove(to_delete,metafile=True)
+
+    def rmdir(self,fpath,recursive=False,metafile=False):
+        abspath = self.get_paths(fpath).absolute
+        if self.verbose: util.red(f"removing {abspath}")
+        with self.lock(fpath):
+            if recursive:
+                for item in self.listdir(abspath):
+                    to_delete = join(abspath,item)
+                    assert to_delete.startswith(self.root)
+                    assert to_delete.startswith(os.environ['HOME']) # im just really scared of deleting '/' somehow
+                    if self.isfile(to_delete):
+                        self.remove(to_delete,metafile=metafile)
+                    if self.isdir(to_delete):
+                        self.rmdir(to_delete,recursive=True,metafile=metafile)
+            rmdir(abspath)
+
 
     def no_locks(self):
-        assert len(self.locks) == 0, f"{self.locks}"
+        assert len(self.lock_time) == 0, f"{self.lock_time}"
 
-
-    ## lockeddir stuff
-    def add_lockeddir(self,fpath):
-        """
-        After calling _add_lockeddir(abspath) any future read/write to files that start with `abspath` will have to take this lock.
-        """
-        abspath = self.get_paths(fpath).absolute
-        assert isdir(abspath), "can't make a lockeddir on something that's not already a directory"
-        assert self._get_parent_lockeddir(abspath) is None, "Can't make a lockeddir inside a lockeddir"
-        if self.verbose: print(f"adding lockeddir {abspath}")
-        with self.open(self.lockeddirlist,'+') as f:
-            paths = f.read().split('\n')
-            paths.append(abspath)
-            f.write('\n'.join(paths))
-
-    def ensure_mkdir_locked(self,fpath):
-        """
-        Makes the directory at `fpath` a locked directory. If it already exists and is a locked directory then do nothing. If it already exists and isn't locked, throw an error.
-        """
-        paths = self.get_paths(fpath)
-        assert not isfile(paths.abspath)
-        if isdir(paths.abspath): # if it's already created assert that it is a locked directory
-            assert self._get_parent_lockeddir(paths.abspath) == paths.abspath
-        else: # not created
-            self.mkdir(paths.abspath,locked=True)
-
-    def _remove_lockeddir(self,abspath):
-        if self.verbose: print(f"removing lockeddir {abspath}")
-        with open(self.lockeddirlist,'+') as f:
-            paths = f.read().split('\n')
-            paths.remove(abspath)
-            f.write('\n'.join(paths))
-
-    def _get_parent_lockeddir(self,abspath):
-        """
-        Returns None if none of the parents of `abspath` is a locked directory, otherwise returns the locked directory's absolute path
-        """
-        with open(self.lockeddirlist,'r') as f:
-            paths = f.read().split('\n')
-            if len(paths) == 1 and paths[0] == '':
-                return None
-        for path in paths:
-            if abspath.startswith(path):
-                return path
-        return None
-
-    def load(self, fpath, expiration_check=True, no_error_on_dir=False, **kwargs):
-        # TODO make this load_nosplay and make another load() for splayed stuff
+    def load_nosplay(self, fpath, **kwargs):
+        # TODO make a load() for splayed stuff
         """
         Does a locked load on a file using torch.load()
+        Note that the lock is released after the load is finished, so you should lock fpath yourself if you want to make changes then write them while keeping it locked the whole time.
         """
-        fpath = self.get_paths(fpath).absolute
-        with self.fs.lock(fpath):
-            loaded = torch.load(fpath,**kwargs)
+        abspath = self.get_paths(fpath).absolute
+        with self.lock(fpath):
+            loaded = torch.load(abspath,**kwargs)
         return loaded
 
     @contextmanager
-    def modify(self,fpath, expiration_check=True, no_error_on_dir=False, strict=True, autosave=True):
+    def modify(self,fpath, expiration_check=True, strict=True, autosave=True):
         """
         Contextmanager for modifying an object saved at a path
         """
@@ -204,122 +217,107 @@ class SyncedFS:
                     raise Exception("You forgot to call `savefn` after modifying your value! If you didn't want to call it use `modify(strict=False)`")
 
     @contextmanager
-    def lock(self,fpath, expiration_check=True, no_error_on_dir=False):
+    def lock(self,fpath, expiration_check=True):
         """
         Spins until a lock is acquired on a file. `fpath` can be absolute or relative and error checking will be done for you.
         Also checks if a lock is expired and automatically unlocks it if so.
         """
-        if self.verbose: print(f"lock({fpath}) called")
-        self.manual_lock(fpath,expiration_check=expiration_check, no_error_on_dir=no_error_on_dir)
+        #if self.verbose: print(f"lock({fpath}) called")
+        self.manual_lock(fpath,expiration_check=expiration_check)
         try:
             yield None
         finally:
-            print("RELEASING")
-            self.unlock(fpath,no_error_on_dir=no_error_on_dir)
+            self.unlock(fpath)
 
     def haslock(self,fpath):
         """
-        Takes a file path (NOT a lockfile) and checks if we're holding the lock for it
+        Takes a file path (NOT a lockpath) and checks if we're holding the lock for it
         """
-        if self.get_paths(fpath).lock in self.locks:
-            return True
-        return False
+        return self.get_paths(fpath).lock in self.lock_time
+
     def save(self,obj,fpath,attr_str=None):
         splay = Splay(obj,fpath,self,attr_str=attr_str)
         splay.save()
-    def save_nosplay(self,obj,fpath,no_lock=False,path_check=True):
+
+    def save_nosplay(self,obj,fpath,no_lock=False):
         """
         Does a torch.save on the provided object, using a temp file for safety in case we're interrupted. Doesn't do any splaying. Use `no_lock` to not take a lock (perhaps needed for some internal files that dont have locks). `path_check` is there for the same reason, eg if you wanna forcibly save something with a reserved extension.
         """
-        if path_check:
-            abspath = self.get_paths(fpath).absolute
-
-        if no_lock:
-            torch.save(obj,f"{abspath}.tmp.{os.getpid()}") # safe since varnames cant have dots anyways
-            os.rename(f"{abspath}.tmp.{os.getpid()}",abspath)
-            return
-        with self.lock(abspath):
+        abspath = self.absolute(fpath)
+        with (self.lock(fpath) if not no_lock else nocontext()):
             torch.save(obj,f"{abspath}.tmp.{os.getpid()}") # safe since varnames cant have dots anyways
             os.rename(f"{abspath}.tmp.{os.getpid()}",abspath)
 
-    def manual_lock(self, fpath, expiration_check=True, no_error_on_dir=False):
+    def manual_lock(self, fpath, expiration_check=True):
         """
         Spins until a lock is acquired on a file. `fpath` can be absolute or relative and error checking will be done for you.
-        Also checks if a lock is expired and automatically unlocks it if so.
-        Returns nothing.
-        Lock must be freed with .unlock() at the end of use.
-        See `lock` for a contextmanager version of this with unlocks at the end for you, and should be used the vast majority of the time.
+        Also checks if a lock is expired (as long as `expiration_check=True`) and automatically unlocks it if so.
+        Doesn't return anything.
+        *Lock must be freed with fs.unlock() at the end of use.*
+        See `lock()` for a contextmanager version of this with unlocks at the end for you, and should be used the vast majority of the time.
         """
-        if self.verbose: print(f"manual_lock({fpath}) called")
+        #if self.verbose: print(f"manual_lock({fpath}) called")
         paths = self.get_paths(fpath)
-
-        fail_because_dir = isdir(paths.absolute)
-
-        # check if there's a parent locked directory and if so use that lock instead
-        parent = self._get_parent_lockeddir(paths.absolute)
-        if parent is not None:
-            paths = self.get_paths(parent)
-            fail_because_dir = False
-
-        if fail_because_dir and no_error_on_dir:
-            return
-        if fail_because_dir:
-            raise LockError(f"You can't take a lock on a directory that isn't a lockeddir or child of a lockeddir")
+        if self.ismetafile(fpath):
+            return # we don't lock lock files and guard extensions but its useful to be able to call lock() on them when doing things like iterating over directories
 
         tstart = time.time()
-        # spinlock
+        # spinlock with _try_lock() attempts
         while not self._try_lock(paths.lock):
             if expiration_check:
                 self._unlock_if_expired(paths)
             if time.time()-tstart > 5:
                 print("Been waiting for a lock for over 5 seconds...")
 
-    # unlocks a file, throws an error if it was already unlocked (eg someone unlocked it bc of expiration)
-    def unlock(self,fpath,no_error_on_dir=False):
+        # If we just locked a directory, we now lock all sub items
+        if self.isdir(fpath):
+            if self.verbose: util.green("took a directory lock, so now taking locks on all sub items")
+            for item in self.listdir(fpath):
+                self.manual_lock(join(fpath,item),expiration_check=expiration_check)
+
+    def unlock(self,fpath):
         """
-        Unlock a lock that you own
+        Unlock a lock that you own, throwing an error if it's already unlocked, or you dont own it.
+        See _unlock(ours=False) if you'd like to unlock a lock that you don't own.
         """
         if self.verbose: print(f"unlock({fpath}) called")
         paths = self.get_paths(fpath)
+        if self.ismetafile(fpath):
+            return # we don't lock lock files and guard extensions but its useful to be able to call lock()/unlock() on them when doing things like iterating over directories
 
-        fail_because_dir = isdir(paths.absolute)
-
-        # check if there's a parent locked directory and if so use that lock instead
-        parent = self._get_parent_lockeddir(paths.absolute)
-        if parent is not None:
-            paths = self.get_paths(parent)
-            fail_because_dir = False
-
-        # this is nearly unnecessary in `unlock` except that we need it bc lock() returns early so unlock() must too or else itll try to unlock a dir that was never locked by lock()
-        if fail_because_dir and no_error_on_dir:
-            return
-        if fail_because_dir:
-            raise LockError(f"You can't free a lock on a directory that isn't a lockeddir or child of a lockeddir")
-
-        if paths.lock not in self.locks:
+        if paths.lock not in self.lock_time:
             raise LockError("You can't free a lock you didn't take!")
-        if self._try_lock(paths.guard) is False:
-            raise LockError("There shouldn't be any competition for the guard on a lock we own, unless we're over the expiration limit which is not okay!")
-        # we now have the guard lock.
-        # now lets make sure the lock is still ours
-        if self.verbose: print(f"acquired guard lock")
+
+        # grab the guard, which is occupied in rare cases through certain race conditions with _unlock_if_expired etc
+        start = time.time()
+        while self._try_lock(paths.guard) is False:
+            if time.time() - start > 5:
+                print("Been waiting for a guard that should almost never be taken for 5 seconds")
+
+        #if self.verbose: print(f"acquired guard lock")
         try:
-            #lockmsg = self._get_lockmsg(paths.lock)
-            #if lockmsg.pid != os.getpid():
-            #    raise LockError("We're trying to unlock a lock we don't own!")
             self._unlock(paths.lock) ## unlocking it
         finally: # free up the guard no matter what
-            if self.verbose: print(f"released guard lock")
+            #if self.verbose: print(f"released guard lock")
             self._unlock(paths.guard)
 
-    ## under the hood methods (all start with '_')
+        # If we just unlocked a directory, we now unlock all sub items
+        if self.isdir(fpath):
+            if self.verbose: util.purple("freed a directory lock, so now freeing locks on all sub items")
+            for item in self.listdir(fpath):
+                self.unlock(join(fpath,item))
 
     def _get_lockmsg(self,lockpath):
+        """
+        Gets the message embedded in a lock/guard, which has info like the PID/time/name of whoever created the lock.
+        Returns None if the lockfile has been created but the message has not yet been written into it (ie race condition)
+        """
         try:
             with open(lockpath,'r') as f:
                 text = f.read().split(' ')
-                assert len(text) == 3
-                pid,lock_time,name = float(text[0]),float(text[1]),text[2]
+                if len(text) < 3:
+                    raise LockMsgNotWrittenError # lockfile created but not message in it yet
+                pid,lock_time,name = int(text[0]),float(text[1]),text[2]
                 lockmsg = LockMsg(pid,lock_time,name)
                 return lockmsg
         except FileNotFoundError:
@@ -327,7 +325,7 @@ class SyncedFS:
         except OSError as e:
             raise LockError(f"read_lockmsg() failed due to an OSError: {e}")
 
-    def _sanitize(self,fpath,mode='none'):
+    def _sanitize(self,fpath):
         """
         Makes sure the provided path doesnt use any reserved names and is somewhere inside self.root, and turns it from whatever it is (aboslute or relative) into a path relative to self.root, with no trailing '/' even if it's a directory.
         """
@@ -336,14 +334,8 @@ class SyncedFS:
             if not fpath.startswith(self.root):
                 raise ValueError(f"File {fpath} is an absolute path not in the root directory {self.root}")
             fpath = fpath[len(self.root):] # get path relative to self.root
-        while fpath[-1] == '/': # remove all trailing '/'
+        if fpath[-1] == '/': # remove trailing '/' if any
             fpath = fpath[1:]
-        #if isdir(join(self.root,fpath)):
-        #    raise ValueError(f"{fpath} is a directory, but must be a file (or uncreated) for all syncronization operations")
-        if fpath.startswith(self.lockdir):
-            raise ValueError(f"{fpath} starts with the lock directory, which is an invalid place for non-lock files")
-        if fpath.endswith(GUARD_EXTENSION):
-            raise ValueError(f"{fpath} ends with the lock guard extension {GUARD_EXTENSION} which is invalid for non-guard files")
         return fpath
 
     def get_paths(self,fpath): # any path -> Paths
@@ -351,26 +343,39 @@ class SyncedFS:
         Returns the Path namedtuple given any absolute or relative `fpath`, and does proper checking on `fpath`.
         """
         fpath = self._sanitize(fpath)
-        return Paths(join(self.root,fpath),join(self.lockdir,fpath),join(self.lockdir,fpath+GUARD_EXTENSION))
+        abspath = join(self.root,fpath)
+        return Paths(abspath, abspath+LOCK_EXTENSION, abspath+GUARD_EXTENSION, fpath)
 
     def _try_lock(self,lockpath):
         """
         Makes a single attempt to take a lock, returning True if taken and False if the lock is busy.
-        If successful, we add the lock to self.locks and increment its lock_count
+        If successful, we add the lock to self.lock_time and increment its lock_count
+        Works for both locks and guards
         """
         lock_time = time.time()
         lockmsg = f"{os.getpid()} {lock_time} {self.name}"
-        if self.verbose: print(f"attempting to lock {lockpath}")
+        #if self.verbose: print(f"attempting to lock {lockpath}")
 
-        if lockpath in self.locks:
+        # check if we already have the lock
+        if lockpath in self.lock_time:
             self.lock_count[lockpath] += 1
+            if self.verbose: print("we already own this lock, incrementing lock_count")
             return True # we let ppl take a lock multiple times if they already own it, incrementing `self.lock_count[lockpath]` each time
 
+        # check for directory locks all along the path that we're locking
+        dirs = lockpath[len(self.root):].split('/')
+        for i in range(len(dirs)):
+            dirlock = ''.join(dirs[:i+1])+LOCK_EXTENSION
+            if isfile(dirlock):
+                return False # someone locked a directory along the path that we're trying to lock, so we give up
+
+        # try to take hte lock
         try:
+            tmpfile = f"{lockpath}.{os.getpid()}"
             with open(lockpath,'x') as f: # open in 'x' mode (O_EXCL and O_CREAT) so it fails if file exists
                 f.write(lockmsg)
-                print(f"wrote lock message to {lockpath}")
-            self.locks[lockpath] = lock_time
+                if self.verbose: util.green(f"LOCKED {self.get_paths(lockpath).relative}")
+            self.lock_time[lockpath] = lock_time
             self.lock_count[lockpath] = 1
             return True # we got the lock!
         except FileExistsError:
@@ -378,13 +383,13 @@ class SyncedFS:
 
     def _unlock(self,lockpath,ours=True):
         """
-        When called with `ours`=True, we must own the lock, and it does decrements our lock_count[lockpath] and pop the lock from self.locks if the count hits 0.
+        When called with `ours`=True, we must own the lock, and it does decrements our lock_count[lockpath] and pop the lock from self.lock_time if the count hits 0.
         When called with `ours`=False, this is unchecked unlocking, it just calls `rm` and throws a LockError if the file doesn't exist.
         """
-        if self.verbose: print(f"_unlock({lockpath})")
+        #if self.verbose: print(f"_unlock({lockpath})")
 
         if ours is True:
-            assert lockpath in self.locks
+            assert lockpath in self.lock_time
             self.lock_count[lockpath] -= 1
             if self.lock_count[lockpath] > 0:
                 return # we only release a lock once lock_count hits 0
@@ -392,45 +397,61 @@ class SyncedFS:
         # remove the lock
         try:
             os.remove(lockpath)
+            if self.verbose: util.purple(f"FREED {self.get_paths(lockpath).relative}")
         except OSError as e:
             raise LockError(f"_unlock() failed due to an OSError: {e}")
 
         if ours is True:
             # cleanup the lock
-            if time.time()-self.locks[lockpath] >= EXPIRATION_TIMEOUT:
-                self.locks.pop(lockpath)
+            time_held = time.time()-self.lock_time[lockpath]
+            self.lock_time.pop(lockpath)
+            self.lock_count.pop(lockpath)
+            if time_held >= EXPIRATION_TIMEOUT:
                 raise LockError("You held the lock for too long, that's not allowed!")
-            self.locks.pop(lockpath)
 
 
     def _unlock_if_expired(self,paths):
-
         """
         Checks if a lock is expired and safely removes it if so.
         Implementation Note: we do not acquire the guard on a lock unless we already know it's expired, then once we get the guard we recheck the expiration. We don't just take the guard at the start bc this method is called very frequently and we dont want to increase guard traffic unnecessarily given that expiration should not be common anyways.
         """
+
+        # read lock message
         try:
             lockmsg = self._get_lockmsg(paths.lock)
-        except LockNotFoundError:
+            # see if expired (we do not get the guard yet bc thats unnecessary traffic since locks usually arent expired anyways)
+            if time.time()-lockmsg.time < EXPIRATION_TIMEOUT:
+                return # it hasn't expired
+        except (LockNotFoundError,LockMsgNotWrittenError): # raised by _get_lockmsg()
             return # someone already freed the lock for us
-        if time.time()-lockmsg.time < EXPIRATION_TIMEOUT:
-            return # it hasn't expired
-        print("[warn] expired lock detected: {paths.lock} {lockmsg}")
+
+
+        print(f"[warn] expired lock detected: {paths.lock} {lockmsg}")
+        # get the guard
         if not self._try_lock(paths.guard):
             return # someone else has the guard, so we'll let them remove it
+
         try:
+            # now that we have the guard we should check the lock expiration again, in case someone changed it while we were getting the guard (see comment above for why we dont take the guard before checking expiration)
+            if time.time()-self._get_lockmsg(paths.lock).time < EXPIRATION_TIMEOUT:
+                return
+
+            # unlock the expired lock
             if self.verbose: print(f"[warn] unlocking expired lock")
             if is_alive(lockmsg.pid):
-                print("The creator of this lock (pid {lockmsg.pid}) is still alive (unless someone took its pid)")
+                print(f"The creator of this lock (pid {lockmsg.pid}) is still alive (unless someone took its pid)")
             else:
-                print("The creator of this lock (pid {lockmsg.pid}) is not an active process")
+                print(f"The creator of this lock (pid {lockmsg.pid}) is not an active process")
             self._unlock(paths.lock,ours=False)
+        except (LockNotFoundError,LockMsgNotWrittenError): # raised by _get_lockmsg()
+            return
         finally:
             self._unlock(paths.guard)
-        return
+
 
 class LockError(Exception): pass
 class LockNotFoundError(LockError): pass
+class LockMsgNotWrittenError(LockError): pass
 
 # must be a class since closures can't be pickled
 class SaveFn:
@@ -462,11 +483,24 @@ class SharedObject:
         'new' -> call .new() using *args **kwargs. Also throw an error if it already exists()
         'old' -> Throw an error if it doesn't already exists()
         'clean' -> call .new() no matter what, even if it already exists (like 'any' but also wipes it clean)
+
+
+    Defined attributes you can use:
+        .name: the file name at the end of `relpath` or `path`
+        .relpath: path relative to `self.fs.root`
+        .abspath: absolute path
+        .fs: the SyncedFS -- you can use this to mkdir etc, whatever you want.
     """
-    def __init__(self,path,fs,mode,     *args,**kwargs):
+    RESERVED = ['fs','name','abspath','relpath','load_count', 'attr_dict']
+    def __init__(self,relpath,fs,mode,     *args,**kwargs):
         self.fs = fs
-        self.path = fs.get_paths(path).absolute
-        self.loaded = False # whether we're in the self.load() contextmanager
+        self.relpath = relpath
+        if '/' in relpath:
+            self.name = relpath[relpath.rindex('/')+1:]
+        else:
+            self.name = relpath
+        self.abspath = fs.absolute(relpath)
+        self.load_count = 0 # depth of load recursion. 0 means we're unloaded, >0 means we're loaded. Same idea as fs.lock_count
         with self.lock():
             if mode == 'any':
                 if not self.exists():
@@ -482,55 +516,63 @@ class SharedObject:
                 raise Exception(f"Mode {mode} not recognized in SharedObject __init__")
 
     def new(self):
+        if self.fs.verbose: util.yellow('New sharedobject')
         with self.lock():
-            self.fs.save({},self.path) # save an empty dict at our path. This is our attribute dict.
+            self.fs.save_nosplay({},self.abspath) # save an empty dict at our path. This is our attribute dict.
 
     def exists(self):
         """
         Boolean indicating if new() has been called on this file path yet (ie is there a saved file at self.path?)
         """
-        return os.path.isfile(self.path) or self.path.isdir(self.path)
+        return self.fs.isfile(self.abspath) or self.fs.isdir(self.abspath)
 
     @contextmanager
     def lock(self,*args,**kwargs):
         """
         Grabs our lock!
         """
-        yield self.fs.lock(self.path,*args,**kwargs)
+        yield self.fs.lock(self.abspath,*args,**kwargs)
 
     @contextmanager
     def load(self):
         """
-        This is an extremely important contextmanager. If you load do any attr mutation operation you probably want to use it. It holds a lock the whole time and loads the whole shared object into local memory for the duration of the contextmanager. Any getattr/setattr calls will use this local version, a
+        This is an extremely important contextmanager. If you load do any attr mutation operation you probably want to use it. It holds a lock the whole time and loads the whole shared object into local memory for the duration of the contextmanager. Any getattr/setattr calls will use this local version. This contextmanager recurses with no issues. Nobody else can access the shared object as long as you have it loaded, since load() takes a lock().
         Why this is so important:
             If you do sharedobj.mylist.pop() outside of this contextmanager the 'mylist' attr will be loaded from disk, then pop() will be called on it, but it won't be written back to disk.
             If you have it wrapped in a load() then all of the attributes will be loaded into self.attr_dict, then the 'mylist' attr will simply be taken from this local dict, so when pop() is called it will modify the mylist copy in the local dict, and at the very end everything will get flushed back to disk when load() ends.
         """
         with self.lock():
-            self.attr_dict = self.fs.load_nosplay(self.path)
-            self.loaded = True
+            self.load_count += 1
+            if self.fs.verbose: util.yellow(f'load(load_count={self.load_count})')
+            if self.load_count == 1: # if this is first load since being unloaded
+                if self.fs.verbose: util.green(f'--loaded--')
+                self.attr_dict = self.fs.load_nosplay(self.abspath)
             try:
                 yield None
             finally:
-                self.save_nosplay(self.attr_dict,self.path)
-                self.loaded = False
+                self.load_count -= 1
+                if self.fs.verbose: util.yellow(f'unload(load_count={self.load_count})')
+                if self.load_count == 0: # unload for real
+                    self.fs.save_nosplay(self.attr_dict,self.abspath)
+                    if self.fs.verbose: util.purple(f'--unloaded--')
 
     def __getattr__(self,attr):
-        if attr in ['fs','path','sticky','attr_dict']:
+        if attr in SharedObject.RESERVED:
             super().__getattr__(attr)
-        if self.loaded: # use local copy if `loaded`
-            return self.attr_dict[attr]
-        with self.load():
-            return self.attr_dict[attr]
+        with self.load(): # loads it if not already loaded
+            if self.fs.verbose: util.gray(f'getattr {attr}')
+            try:
+                return self.attr_dict[attr]
+            except KeyError:
+                pass # if we raised AttributeError in here the error message would look bad by blaming it on the KeyError
+            raise AttributeError(str(attr))
 
     def __setattr__(self,attr,val):
-        if attr in ['fs','path','sticky','attr_dict']:
+        if attr in SharedObject.RESERVED:
             super().__setattr__(attr,val)
             return
-        if self.loaded: # use local copy if `loaded`
-            self.attr_dict[attr] = val
-            return
-        with self.load():
+        with self.load(): # loads it if not already loaded
+            if self.fs.verbose: util.gray(f'setattr {attr}')
             self.attr_dict[attr] = val
 
     def __delattr__(self,attr):
@@ -573,10 +615,10 @@ class Splay:
             for attr in attr_str.split('.'):
                 obj = getattr(obj,attr)
                 fpath = os.path.join(fpath,attr)
-        fpath = fs.get_paths(fpath).absolute
+        abspath = fs.get_paths(fpath).absolute
 
         # this is not actually a splay tree lol, i just like the name. I have no idea what a splay tree actually is.
-        self.path = fpath
+        self.path = abspath
         self.fs = fs
         self.splay_tree = self.build_splay_tree(obj)
     def save(self):
@@ -593,12 +635,12 @@ class Splay:
             attr_dict = obj.splay_fn() # dir of attr->val
             if attr_dict is None: # obj.mgsave()->None indicates an object should never be saved
                 return None
-            # recursively _get_save on all the attrs
+            # recursively build_splay_tree() on all the attrs
             attr_dict = { attr:self.build_splay_tree(val) for attr,val in attr_dict.items() }
             return attr_dict
         # normal object with no mgsave
         return Leaf(obj) # to differentiate it from None or dict etc.
-    def do_save(self,save_path,save_val):
+    def do_save(self,save_val,save_path):
         """
         Calls torch.save to actually save a save_val tree
         See comment in `_get_save` to see why we do different things for different types of `get_save`
@@ -611,7 +653,7 @@ class Splay:
         elif type(save_val) == dict: # tree case
             for attr,val in save_val.items():
                 path = os.path.join(save_path,attr)
-                self.do_save(self,path,val)
+                self.do_save(val,path)
         else:
             raise Exception("Unrecognized type sent to `do_save`")
 
@@ -620,10 +662,9 @@ class Leaf:
         self.val=val
 
 
-
-
-def main():
+def main(mode):
     fs = SyncedFS('mg','test',verbose=True)
+    fs.unlock_all()
 
     # message writing test
     with fs.open('test','w') as f:
@@ -636,13 +677,184 @@ def main():
     with fs.open('test','r') as f:
         assert f.read() == 'message1\nmessage2'
 
+    # recursive locks test
+    with fs.lock('test'):
+        with fs.lock('test'):
+            with fs.open('test','w') as f:
+                f.write('message')
+
+
+    # make sure that message was written successfully
+    with fs.open('test','r') as f:
+        assert f.read() == 'message'
+
+
+
+    # multiprocess tests
+    if mode == 1:
+        with fs.open('test','w') as f:
+            print("START")
+            print('Now launch this process again (preferably multiple copies) within 7 seconds!')
+            sleep(7)
+            f.write('message')
+            print("END")
+    elif mode == 2:
+        util.green("Parent trying to get lock")
+        fs.manual_lock('test2') # take a lock and dont release it
+        if self.verbose: util.green("Parent got lock")
+        if os.fork() != 0:
+            util.green("Parent sleeping with lock")
+            sleep(15) # need to sleep a while in the parent otherwise the lock will be released when the child clears the parent since its an old pid
+            util.green("Parent exiting")
+            exit(0)
+        else:
+            sleep(1)
+            fs = SyncedFS('mg','test',verbose=True) # so we dont inherit fs.locks from parent
+            util.green("Child trying to get lock")
+            fs.manual_lock('test2') # take lock in child, which should succeed after 10 seconds
+            util.green("Child got lock")
+            fs.unlock('test2') # cleanup
+            util.green("Child released lock")
+
 
     # make sure we aren't still holding any locks
     fs.no_locks()
 
+def dirtest():
+    util.green("DIRTEST")
+    fs = SyncedFS('mg','test',verbose=True)
+    fs.wipe()
+    # directories
+
+    # populate testdir
+    fs.mkdir('testdir')
+    with fs.open('testdir/testfile','w') as f:
+        f.write('test')
+    with fs.open('testdir/testfile2','w') as f:
+        f.write('test')
+
+    # populate testdir/subdir
+    fs.mkdir('testdir/subdir')
+    with fs.open('testdir/subdir/subfile1','w') as f:
+        f.write('test')
+    with fs.open('testdir/subdir/subfile2','w') as f:
+        f.write('test')
+
+    #populate testdir/subdir/subdir
+    fs.mkdir('testdir/subdir/subdir')
+    with fs.open('testdir/subdir/subdir/ss1','w') as f:
+        f.write('test')
+    with fs.open('testdir/subdir/subdir/ss2','w') as f:
+        f.write('test')
+
+    # lock testdir/subdir
+    fs.manual_lock('testdir/subdir')
+    # lock testdir/subdir/subdir
+    fs.manual_lock('testdir/subdir/subfile1')
+    # lock testdir
+    fs.manual_lock('testdir')
+    fs.unlock('testdir/subdir')
+    fs.unlock('testdir')
+    fs.unlock('testdir/subdir/subfile1')
+    fs.no_locks()
+
+def wipetest():
+    fs = SyncedFS('mg','test',verbose=True)
+    fs.wipe()
+def dirtest2():
+    #util.green("Run wipetest before this, then launch this twice")
+    dirtest() # set up some dirs/files for us to work with
+    if os.fork() == 0:
+        fs = SyncedFS('mg','test',verbose=True)
+        util.yellow('FIRST try lock')
+        fs.manual_lock('testdir/subdir')
+        util.yellow('FIRST got lock')
+        sleep(1)
+        fs.unlock('testdir/subdir')
+        util.yellow('FIRST released lock')
+        fs.no_locks()
+    else:
+        fs = SyncedFS('mg','test',verbose=True)
+        sleep(.2)
+        util.yellow('SECOND try lock')
+        fs.manual_lock('testdir/subdir/subdir/ss2') # will have to wait 1 sec
+        util.yellow('SECOND got lock')
+        fs.unlock('testdir/subdir/subdir/ss2')
+        util.yellow('SECOND released lock')
+        fs.no_locks()
+
+
+
+def sharedobject_test():
+    fs = SyncedFS('mg','test',verbose=True)
+    obj = SharedObject('mrtest',fs,'any')
+    if hasattr(obj,'a'):
+        util.blue(obj.a)
+    obj.a = 3
+    obj.b = {'test':4}
+    print(obj.a)
+
+
+def sharedobject_test2():
+    util.blue("Messages in blue should be counting up from 1")
+
+    if os.fork() == 0:
+        fs = SyncedFS('mg','test',verbose=True)
+        obj = SharedObject('mrtest',fs,'clean') # make new obj
+        with obj.load():
+            util.blue(1)
+            obj.message = "hey there process 2"
+        sleep(.1) # give up lock
+        with obj.load():
+            util.blue(3)
+            assert obj.message == "yo whats up process 1"
+            assert obj.list == [1,2,3,4,5]
+            assert obj.list is obj.samelist
+            obj.list.pop()
+            print("sending this:",obj.list)
+
+    else:
+        fs = SyncedFS('mg','test',verbose=True)
+        sleep(.05)
+        obj = SharedObject('mrtest',fs,'old') # access existing obj
+        assert obj.message == "hey there process 2"
+        with obj.load():
+            util.blue(2)
+            obj.message = "yo whats up process 1"
+            obj.list = [1,2,3,4,5]
+            obj.samelist = obj.list
+        sleep(.1) # give up lock
+        print("got this:",obj.list)
+        util.blue(4)
+
+
+
+@contextmanager
+def nocontext():
+    try:
+        yield None
+    finally:
+        pass
 
 
 if __name__ == '__main__':
+    if len(sys.argv) > 1:
+        mode = int(sys.argv[1])
+    else:
+        mode = 0
     with debug(True):
-        main()
+        if mode == 3:
+            dirtest()
+        elif mode == 4:
+            sharedobject_test()
+        elif mode == 5:
+            wipetest()
+        elif mode == 6:
+            dirtest2()
+        elif mode == 7:
+            sharedobject_test2()
+        else:
+            main(mode)
+
+
 
