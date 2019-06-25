@@ -1,4 +1,5 @@
 import syncfs
+import random
 import torch
 import os
 from syncfs import SharedObject
@@ -6,9 +7,7 @@ import util
 import argparse
 
 """
-Magnesium aims to be an ML manager that lets multiple processes work together, sharing knowledge about the results of using different hyperparameters etc. It's cool because you don't need to be running a server for it to work, instead every client works together to make sure they don't interfere with each other and they get the most up to date information. That's an impressive way of saying it's pretty much just a synchronous filesystem.
-
-
+Random notes:
 Splays: Loading big torch.save()d files is annoying, so what if each of the attributes were saved separately?
 
 Here's the idea:
@@ -23,18 +22,10 @@ mg.save('stats') # save only the session.stats, in a nice low-memory manner.
 mg.save('stats.otherthing') # save only the session.stats, in a nice low-memory manner.
 mg.quicksave() # save everything other than the state dicts in a splay
 
-SEE ANY PHONE NOTES IVE ADDED
-
 Should have a built in timer section so results get saved always and you can look back at old timings
 Should record the cmdline args argv[]
 
 blacklisting certain classes
-
-Basically you have a session which just holds you model, dataloaders, optimizer, scheduler, plotter, hypers. It's essentially just a runtime container for those things and no longer deals with saving/loading except that it is ofc the target of both of those often.
-
-
-
-
 
 """
 
@@ -292,7 +283,8 @@ class Project(SharedObject):
         with self.lock():
             super().new()
             self.name = name # unique Experiment name
-            self.exps = {} # expname->Experiment dict with all experiments
+            self.exps = {} # expname->Experiment dict with all experiments.
+            self.next_sugg_id = 0
             if self.fs.isdir(EXPS_DIR):
                 self.fs.rmdir(EXPS_DIR,recursive=True)
             if self.fs.isdir(SESS_DIR):
@@ -417,7 +409,7 @@ class Experiment(SharedObject):
         with self.lock():
             super().new()
             self.name = name # exp name, which is how the user will refer to this exp
-            self.suggestor = suggestor # a Suggestor object
+            self.suggestor = suggestor # a Suggestor object. Doesn't really have any state.
             self.hypers_config = hypers_config # a HypersConfig object
             self.open_suggs = {} # open Suggestion objects
             self.closed_suggs = {} # closed Suggestion objects (ie loss has been reported)
@@ -456,8 +448,10 @@ class Experiment(SharedObject):
         """
         Called by View.get_sugg(). Gets a new suggestion from the Suggestor.
         """
-        sugg = self.suggestor.get_sugg(self)
-        return sugg
+        with self.load():
+            sugg = self.suggestor.get_sugg(self,self.hypers_config.tunable_params,self.next_sugg_id)
+            self.next_sugg_id += 1
+            return sugg
     def flush_suggs(self):
         """
         Called by View.flush_suggs(). Clear all open suggestions.
@@ -509,14 +503,22 @@ class Experiment(SharedObject):
 
 
 class Suggestion:
-    def __init__(self, id, hypers, exp):
+    """
+    A suggested set of hyperparameters to try
+    """
+    def __init__(self, id, hypers_dict, exp):
         self.id = id
-        self.hypers = hypers
+        self.hypers_dict = hypers_dict # a dict from name->val
         self.loss = None
         self.stats = None
     def close(self,loss,stats=None):
         self.loss = loss
         self.stats = stats
+"""
+#sigopt stuff
+if self[name].type == 'bool':
+    val = {'True':True,'False':False}[val]
+"""
 
 def kwargs_of_strargs(strargs,conversion_dict=None):
     """
@@ -541,13 +543,24 @@ def kwargs_of_strargs(strargs,conversion_dict=None):
 
 class Suggestor:
     def get_sugg(self,exp):
+        """
+        Takes an Experiment and returns a Suggestion
+        The most useful field of `exp` will probably be `exp.closed_suggs` which has all the completed suggestion objects, as well as `exp.open_suggs` which ahas all of the currently open suggestion objects. `exp.hypers_config` is necessary too of course.
+        """
         raise NotImplementedError
 
 class RandomSuggestor(Suggestor):
     def __init__(self,strargs):
         super().__init__()
-    def get_sugg(self,exp):
-        raise NotImplementedError
+    def get_sugg(self,exp,tunable_params):
+        hypers_dict = {}
+        for name,param in tunable_params.items():
+            if param.opts is not None: # categorical
+                hypers_dict[name] = random.choice(param.opts)
+            else: # min/max
+                hypers_dict[name] = random.uniform(param.min,param.max)
+                hypers_dict[name] = param.type_cast(hypers_dict[name])
+        return hypers_dict
 
 class SigoptSuggestor(Suggestor):
     def __init__(self,strargs):
@@ -1006,13 +1019,16 @@ class HypersConfig:
                 sig_params.append(dict(name=param.name,type=ty,bounds=dict(min=param.min,max=param.max)))
         return sig_params
 
-    def assign_parameters(self,assignments):
-        # This lives in hypers because do_derivations needs to be called at the end
-        for name,val in assignments.items():
-            if self[name].type == 'bool':
-                val = {'True':True,'False':False}[val]
+    def assign_parameters(self,sugg):
+        """
+        Takes a Suggestion as assigns self[name].val to it for all suggested hypers, then calls do_derivations().
+        Returns `self` so it can be chained with .get_hypers()
+        """
+        # This lives in HypersConfig because do_derivations needs to be called at the end
+        for name,val in sugg.hypers_dict.items():
             self[name].val = val
         self.do_derivations()
+        return self
 
     def __getitem__(self,key):
         return getattr(self,key)

@@ -478,6 +478,8 @@ class SharedObject:
     When you call SharedObject("/path/to/storage",fs) it will attach itself to whatever object lives at /path/to/storage, or will create a new object there if none exists.
     If there's one thing you should know about shared objects, it's that you should be using the load() contextmanager very frequently. If you have a weird bug where data is disappearing or state isn't being held you probably need to use load().
 
+    ** SharedObjects can be pickled and  **
+
     `mode` =
         'any' -> dont throw any errors, just load it if it already exists and create it if it doesn't exist.
         'new' -> call .new() using *args **kwargs. Also throw an error if it already exists()
@@ -514,6 +516,19 @@ class SharedObject:
                 self.new(*args,**kwargs)
             else:
                 raise Exception(f"Mode {mode} not recognized in SharedObject __init__")
+
+    def __getstate__(self):
+        """
+        Override how pickling works to not include attr_dict since we're saving that ourselves and we only want one copy of it to exist.
+        """
+        state = {k:v for k,v in self.__dict__.items() if k != 'attr_dict'} # filter out attr_dict
+        return state
+    def __setstate__(self,state):
+        """
+        Loading from unpickling. We reset loadcount since pickling doesn't save attr_dict so it will need to be reloaded
+        """
+        stats['load_count'] = 0
+        self.__dict__.update(state)
 
     def new(self):
         if self.fs.verbose: util.yellow('New sharedobject')
